@@ -2,281 +2,753 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <title>VOC Segmentation Annotator</title>
+    <title>VOC Segmentation Annotator (CVAT Style)</title>
     <style>
-        /* 基础样式重置 */
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; flex-direction: column; height: 100vh; background: #f0f2f5; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; flex-direction: column; height: 100vh; background: #f0f2f5; overflow: hidden; }
 
-        /* 顶部区域 - 数据集导入 */
-        .header { padding: 15px 20px; background: white; border-bottom: 1px solid #ddd; display: flex; align-items: center; gap: 15px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-        .header h2 { font-size: 18px; color: #333; margin-right: 20px; }
-        .header input { flex: 1; max-width: 450px; padding: 8px 12px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
-        .header button { padding: 8px 16px; background: #1890ff; color: white; border: none; border-radius: 4px; cursor: pointer; transition: background 0.3s; }
-        .header button:hover { background: #40a9ff; }
-        #dataset-status { font-size: 14px; font-weight: bold; }
+        /* 顶部控制台 (导入与工具) */
+        .header { padding: 10px 20px; background: white; border-bottom: 1px solid #ddd; display: flex; align-items: center; justify-content: space-between; box-shadow: 0 1px 3px rgba(0,0,0,0.05); z-index: 10; }
+        .header-left { display: flex; align-items: center; gap: 10px; }
+        .header-left h2 { font-size: 16px; color: #333; margin-right: 15px; }
+        .header-left input { width: 250px; padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
+        .btn-primary { padding: 6px 12px; background: #1890ff; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; transition: all 0.3s; }
+        .btn-primary:hover { background: #40a9ff; }
+        
+        .toolbar-group { display: flex; align-items: center; gap: 10px; background: #f5f5f5; padding: 4px 10px; border-radius: 6px; border: 1px solid #e8e8e8;}
+        .mode-indicator { font-weight: bold; padding: 4px 8px; border-radius: 4px; font-size: 12px; }
+        .mode-select { background: #f6ffed; border: 1px solid #b7eb8f; color: #389e0d; }
+        .mode-draw { background: #fff0f6; border: 1px solid #ffadd2; color: #c41d7f; }
 
-        /* 主体布局 */
-        .main-container { display: flex; flex: 1; overflow: hidden; }
+        /* 自动保存状态按钮 */
+        .btn-save { background: #52c41a; }
+        .btn-save.saving { background: #faad14; color: #fff; }
 
-        /* 左侧边栏 - 图片列表 */
-        .sidebar { width: 300px; background: white; border-right: 1px solid #ddd; display: flex; flex-direction: column; }
-        .sidebar h3 { padding: 15px; border-bottom: 1px solid #eee; margin: 0; font-size: 16px; display: flex; justify-content: space-between;}
-        .image-list { flex: 1; overflow-y: auto; list-style: none; }
-        .image-list li { padding: 12px 15px; cursor: pointer; border-bottom: 1px solid #f5f5f5; display: flex; justify-content: space-between; align-items: center; transition: background 0.2s; }
-        .image-list li:hover { background: #fafafa; }
-        .image-list li.active { background: #e6f7ff; border-right: 4px solid #1890ff; }
-        .file-name { font-size: 14px; color: #333; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px; }
-        .status-badge { font-size: 12px; padding: 2px 6px; border-radius: 10px; }
+        /* CVAT 风格图片导航栏 */
+        .nav-bar { background: #fafafa; border-bottom: 1px solid #ddd; padding: 8px 20px; display: flex; align-items: center; justify-content: center; gap: 15px; }
+        .nav-btn { background: transparent; border: 1px solid #ccc; padding: 4px 12px; cursor: pointer; border-radius: 4px; font-weight: bold; color: #555; }
+        .nav-btn:hover:not(:disabled) { background: #e6f7ff; border-color: #1890ff; color: #1890ff; }
+        .nav-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .image-info { font-size: 14px; font-weight: bold; color: #333; display: flex; align-items: center; gap: 10px; min-width: 300px; justify-content: center; }
+        .status-badge { font-size: 12px; padding: 2px 6px; border-radius: 10px; font-weight: normal; }
         .status-labeled { background: #52c41a; color: white; }
         .status-unlabeled { background: #d9d9d9; color: #666; }
 
-        /* 右侧工作区 */
-        .workspace { flex: 1; display: flex; flex-direction: column; padding: 20px; }
+        /* 主体布局 */
+        .main-container { display: flex; flex: 1; overflow: hidden; background: #e5e5e5; }
+
+        /* 画布区域 */
+        .canvas-area { flex: 1; display: flex; justify-content: center; align-items: center; position: relative; overflow: hidden; padding: 15px; }
+        .image-wrapper { position: relative; display: inline-block; max-width: 100%; max-height: 100%; box-shadow: 0 4px 12px rgba(0,0,0,0.15); background: white; }
+        #main-image { max-width: 100%; max-height: 100%; display: block; object-fit: contain; pointer-events: none; }
+        #draw-canvas { position: absolute; top: 0; left: 0; }
+        .empty-text { color: #888; font-size: 18px; user-select: none; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); }
+
+        /* 右侧 Objects 面板 */
+        .right-sidebar { width: 320px; background: white; border-left: 1px solid #ddd; display: flex; flex-direction: column; z-index: 5; box-shadow: -2px 0 5px rgba(0,0,0,0.02); }
+        .sidebar-header { padding: 12px 15px; background: #fafafa; border-bottom: 1px solid #ddd; font-weight: bold; font-size: 14px; color: #333; display: flex; justify-content: space-between; align-items: center; }
         
-        /* 工具栏 */
-        .toolbar { margin-bottom: 15px; display: flex; gap: 12px; align-items: center; }
+        .object-list { flex: 1; overflow-y: auto; list-style: none; padding: 10px; }
+        .object-item { display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; margin-bottom: 8px; background: #f9f9f9; border: 1px solid #eee; border-radius: 6px; cursor: pointer; transition: all 0.2s; }
+        .object-item:hover { border-color: #d9d9d9; background: #f0f0f0; } 
+        .object-item.active { background: #e6f7ff; border-color: #91d5ff; box-shadow: 0 2px 4px rgba(24,144,255,0.1); }
+        .object-item.hidden { opacity: 0.5; }
+        
+        .obj-left { display: flex; align-items: center; gap: 8px; flex: 1; }
+        .color-block { width: 12px; height: 12px; border-radius: 2px; }
+        .obj-name { font-size: 13px; font-weight: 500; color: #333; }
+        
+        .obj-actions { display: flex; align-items: center; gap: 6px; }
+        .icon-btn { background: none; border: none; cursor: pointer; font-size: 14px; padding: 4px; border-radius: 4px; color: #666; transition: background 0.2s; }
+        .icon-btn:hover { background: #e8e8e8; color: #333; }
+        .icon-delete:hover { background: #fff1f0; color: #ff4d4f; }
 
-        /* 🔥 醒目的红色删除按钮 */
-        .btn-delete { 
-            background-color: #ff4d4f; 
-            color: white; 
-            font-weight: bold; 
-            border: none; 
-            padding: 10px 20px; 
-            border-radius: 6px; 
-            cursor: pointer; 
-            transition: all 0.3s ease; 
-            font-size: 14px;
-        }
-        .btn-delete:hover:not(:disabled) { 
-            background-color: #ff7875; 
-            box-shadow: 0 4px 12px rgba(255, 77, 79, 0.4); 
-            transform: translateY(-1px);
-        }
-        .btn-delete:active:not(:disabled) { 
-            background-color: #d9363e; 
-            transform: translateY(0);
-        }
-        .btn-delete:disabled { 
-            background-color: #f5f5f5; 
-            color: #b8b8b8; 
-            cursor: not-allowed; 
-        }
-
-        .btn-export { background: #52c41a; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: bold; }
-        .btn-export:hover { background: #73d13d; }
-
-        /* 画布/图片显示区 */
-        .canvas-container { flex: 1; background: #e5e5e5; border: 2px dashed #bbb; border-radius: 8px; display: flex; justify-content: center; align-items: center; overflow: hidden; position: relative; box-shadow: inset 0 0 10px rgba(0,0,0,0.05); }
-        #main-image { max-width: 100%; max-height: 100%; display: none; object-fit: contain; }
-        .empty-text { color: #888; font-size: 18px; user-select: none; }
+        /* 全局类别选择器 */
+        .sidebar-footer { padding: 15px; border-top: 1px solid #ddd; background: #fafafa; }
+        .sidebar-footer select { width: 100%; padding: 6px; border-radius: 4px; border: 1px solid #ccc; margin-top: 5px; font-size: 13px; }
     </style>
 </head>
 <body>
 
     <div class="header">
-        <h2>VOC 标注平台</h2>
-        <input type="text" id="dataset-path" placeholder="请输入本地数据集绝对路径 (需包含 images 和 labels 文件夹)">
-        <button onclick="importDataset()">加载数据集</button>
-        <span id="dataset-status"></span>
+        <div class="header-left">
+            <h2>易村标注平台</h2>
+            <input type="text" id="dataset-path" placeholder="输入数据集路径">
+            <button class="btn-primary" onclick="importDataset()">加载目录</button>
+            <span id="dataset-status" style="font-size: 12px; margin-left: 10px;"></span>
+        </div>
+        
+        <div class="toolbar-group">
+            <span id="mode-badge" class="mode-indicator mode-select">模式: 选择 (V)</span>
+            <button id="btn-save" class="btn-primary btn-save" onclick="saveAnnotations(false)">💾 已保存</button>
+            <button class="btn-primary" style="background:#ff4d4f;" onclick="deleteCurrentImage()">🗑️ 删图 (Shift+Del)</button>
+        </div>
+    </div>
+
+    <div class="nav-bar">
+        <button class="nav-btn" id="btn-prev" onclick="navigateImage(-1)" disabled>◀ 快捷键 D</button>
+        <div class="image-info" id="image-info-container">
+            <span id="image-counter" title="点击跳转到指定页" style="cursor: pointer; text-decoration: underline; color: #1890ff;" onclick="jumpToImage()">0 / 0</span>
+            <span id="current-image-name" style="font-family: monospace;">---</span>
+            <span id="image-status-badge"></span>
+        </div>
+        <button class="nav-btn" id="btn-next" onclick="navigateImage(1)" disabled>快捷键 F ▶</button>
     </div>
 
     <div class="main-container">
-        <div class="sidebar">
-            <h3>图片列表 <span id="image-count" style="font-size: 13px; color: #888; font-weight: normal;">(0)</span></h3>
-            <ul class="image-list" id="image-list">
-                </ul>
+        
+        <div class="canvas-area" id="canvas-container">
+            <span class="empty-text" id="empty-text">请导入数据集</span>
+            <div class="image-wrapper" id="image-wrapper" style="display: none;">
+                <img id="main-image" src="" alt="">
+                <canvas id="draw-canvas"></canvas>
+            </div>
         </div>
 
-        <div class="workspace">
-            <div class="toolbar">
-                <button id="btn-delete" class="btn-delete" onclick="deleteCurrentImage()" disabled>
-                    🗑️ 删除当前图 (及其标签)
-                </button>
-                <button class="btn-export" onclick="exportDataset()">📦 导出 ZIP</button>
-                <span id="current-image-name" style="margin-left: auto; color: #666; font-weight: bold;"></span>
+        <div class="right-sidebar">
+            <div class="sidebar-header">
+                <span>Objects (图层)</span>
+                <span id="object-count" style="color:#888; font-weight:normal;">0</span>
             </div>
+            
+            <ul class="object-list" id="object-list">
+                </ul>
 
-            <div class="canvas-container" id="canvas-container">
-                <span class="empty-text" id="empty-text">请在左侧选择一张图片，或在上方导入数据集</span>
-                <img id="main-image" src="" alt="当前标注图片">
+            <div class="sidebar-footer">
+                <label style="font-size: 13px; color: #555; font-weight: bold;">修改选中对象的类别:</label>
+                <select id="class-select" onchange="onClassChange()"></select>
+                <div style="font-size: 11px; color: #888; margin-top: 10px; line-height: 1.5;">
+                    提示: 增删改及拖拽点后会自动保存。<br>
+                    <b>N</b>: 绘制 | <b>V</b>: 选择 | <b>Enter</b>: 闭合<br>
+                    <b>Del</b>: 删除选中 | <b>Ctrl+Z</b>: 撤销
                 </div>
+            </div>
         </div>
     </div>
 
     <script>
-        let currentImageId = null;
         let imagesData = [];
+        let currentIndex = -1;
+        let classesData = {};
 
-        // 页面加载时自动获取当前数据集列表
+        const canvas = document.getElementById('draw-canvas');
+        const ctx = canvas.getContext('2d');
+        const imgEl = document.getElementById('main-image');
+        const colors = ["#ff4d4f", "#1890ff", "#52c41a", "#faad14", "#722ed1", "#eb2f96", "#13c2c2", "#fa8c16"];
+        
+        let mode = 'select'; 
+        let annotations = []; 
+        let currentPolygon = [];
+        let mousePos = null;
+        
+        let selectedAnnoIdx = -1;
+        let hoveredAnnoIdx = -1; 
+        let selectedPointIdx = -1;
+        let isDraggingPoint = false;
+        let historyStack = [];
+
+        let autoSaveTimer = null;
+
         window.onload = () => {
+            fetchClasses();
             fetchImagesList();
             fetchDatasetInfo();
+            setupEvents();
+            window.addEventListener('resize', resizeCanvas);
         };
 
-        // 1. 导入数据集逻辑
-        async function importDataset() {
-            const pathInput = document.getElementById('dataset-path').value.trim();
-            const statusEl = document.getElementById('dataset-status');
+        // ================= 顶栏与导航 =================
+
+        function updateNavigationUI() {
+            const prevBtn = document.getElementById('btn-prev');
+            const nextBtn = document.getElementById('btn-next');
             
-            if (!pathInput) {
-                alert("路径不能为空！");
+            if (imagesData.length === 0 || currentIndex === -1) {
+                prevBtn.disabled = true; nextBtn.disabled = true;
+                document.getElementById('image-counter').innerText = '0 / 0';
+                document.getElementById('current-image-name').innerText = '---';
+                document.getElementById('image-status-badge').innerHTML = '';
                 return;
             }
 
-            statusEl.innerText = "⏳ 校验并加载中...";
-            statusEl.style.color = "#1890ff";
+            prevBtn.disabled = currentIndex === 0;
+            nextBtn.disabled = currentIndex === imagesData.length - 1;
 
+            const currentImg = imagesData[currentIndex];
+            document.getElementById('image-counter').innerText = `${currentIndex + 1} / ${imagesData.length}`;
+            document.getElementById('current-image-name').innerText = currentImg.filename;
+            
+            document.getElementById('image-status-badge').innerHTML = currentImg.hasLabel 
+                ? `<span class="status-badge status-labeled">已标</span>` 
+                : `<span class="status-badge status-unlabeled">未标</span>`;
+        }
+
+        function navigateImage(direction) {
+            if (imagesData.length === 0) return;
+            let nextIdx = currentIndex + direction;
+            if (nextIdx < 0) nextIdx = 0;
+            if (nextIdx >= imagesData.length) nextIdx = imagesData.length - 1;
+            if (currentIndex !== nextIdx) selectImage(nextIdx);
+        }
+
+        function jumpToImage() {
+            if (imagesData.length === 0) return;
+            const input = prompt(`请输入要跳转的页码 (1 - ${imagesData.length})：\n当前在第 ${currentIndex + 1} 页`, currentIndex + 1);
+            if (!input) return; 
+            
+            const targetIdx = parseInt(input.trim()) - 1;
+            if (!isNaN(targetIdx) && targetIdx >= 0 && targetIdx < imagesData.length) {
+                selectImage(targetIdx);
+            } else {
+                alert("⚠️ 输入的页码无效或超出范围！");
+            }
+        }
+
+        async function selectImage(index) {
+            if (index < 0 || index >= imagesData.length) return;
+            
+            // 切换前，强制同步等待正在排队的保存任务完成（防止丢框）
+            if (autoSaveTimer) {
+                clearTimeout(autoSaveTimer);
+                autoSaveTimer = null;
+                await saveAnnotations(true); 
+            }
+
+            historyStack = [];
+            mode = 'select';
+            selectedAnnoIdx = -1;
+            hoveredAnnoIdx = -1;
+            selectedPointIdx = -1;
+            annotations = [];
+            currentPolygon = [];
+            document.getElementById('btn-save').innerText = "💾 已保存";
+            document.getElementById('btn-save').className = "btn-primary btn-save";
+
+            currentIndex = index;
+            const img = imagesData[currentIndex];
+            
+            // 记录当前图片 ID，刷新时断点续传
+            localStorage.setItem('voc_last_image_id', img.id);
+            
+            updateNavigationUI();
+            document.getElementById('empty-text').style.display = 'none';
+            setMode('select');
+
+            try {
+                const res = await fetch(`/api/annotations/${img.id}`);
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data.annotations) {
+                        annotations = data.annotations.map(a => ({...a, visible: true}));
+                    }
+                }
+            } catch (e) {}
+            
+            imgEl.src = img.imageUrl;
+        }
+
+        // ================= 右侧 Objects 面板 =================
+
+        function renderObjectList() {
+            const listEl = document.getElementById('object-list');
+            listEl.innerHTML = '';
+            document.getElementById('object-count').innerText = annotations.length;
+
+            annotations.forEach((ann, idx) => {
+                const li = document.createElement('li');
+                li.className = `object-item ${idx === selectedAnnoIdx ? 'active' : ''} ${!ann.visible ? 'hidden' : ''}`;
+                
+                li.onmouseenter = () => { hoveredAnnoIdx = idx; renderCanvas(); };
+                li.onmouseleave = () => { hoveredAnnoIdx = -1; renderCanvas(); };
+                
+                li.onclick = () => {
+                    setMode('select');
+                    selectedAnnoIdx = idx;
+                    selectedPointIdx = -1;
+                    updateClassSelector();
+                    renderCanvas();
+                    renderObjectList(); 
+                };
+
+                const color = colors[parseInt(ann.cls) % colors.length || 0];
+                const className = classesData[ann.cls] || ann.cls;
+
+                li.innerHTML = `
+                    <div class="obj-left">
+                        <div class="color-block" style="background-color: ${color}"></div>
+                        <span class="obj-name">${className}</span>
+                    </div>
+                    <div class="obj-actions">
+                        <button class="icon-btn" title="${ann.visible ? '隐藏' : '显示'}" onclick="toggleVisibility(event, ${idx})">
+                            ${ann.visible ? '👁️' : '🙈'}
+                        </button>
+                        <button class="icon-btn icon-delete" title="删除" onclick="deleteObject(event, ${idx})">
+                            🗑️
+                        </button>
+                    </div>
+                `;
+                listEl.appendChild(li);
+            });
+            updateClassSelector();
+        }
+
+        function toggleVisibility(e, idx) {
+            e.stopPropagation();
+            annotations[idx].visible = !annotations[idx].visible;
+            if(!annotations[idx].visible && selectedAnnoIdx === idx) {
+                selectedAnnoIdx = -1; 
+            }
+            renderObjectList();
+            renderCanvas();
+        }
+
+        function deleteObject(e, idx) {
+            e.stopPropagation();
+            saveState();
+            annotations.splice(idx, 1);
+            if (selectedAnnoIdx === idx) selectedAnnoIdx = -1;
+            if (hoveredAnnoIdx === idx) hoveredAnnoIdx = -1;
+            renderObjectList();
+            renderCanvas();
+            triggerAutoSave(); 
+        }
+
+        // ================= 快捷键与状态控制 =================
+
+        function setMode(newMode) {
+            mode = newMode;
+            const badge = document.getElementById('mode-badge');
+            if (mode === 'draw') {
+                badge.className = 'mode-indicator mode-draw';
+                badge.innerText = '模式: 绘制 (N)';
+                canvas.style.cursor = 'crosshair';
+                selectedAnnoIdx = -1;
+                selectedPointIdx = -1;
+            } else {
+                badge.className = 'mode-indicator mode-select';
+                badge.innerText = '模式: 选择 (V)';
+                canvas.style.cursor = 'default';
+                currentPolygon = [];
+            }
+            renderCanvas();
+            renderObjectList();
+        }
+
+        function saveState() {
+            historyStack.push(JSON.stringify({
+                annotations: annotations.map(a => ({...a, points: [...a.points]})),
+                currentPolygon: [...currentPolygon]
+            }));
+            if (historyStack.length > 30) historyStack.shift();
+        }
+
+        function undo() {
+            if (historyStack.length > 0) {
+                const state = JSON.parse(historyStack.pop());
+                annotations = state.annotations;
+                currentPolygon = state.currentPolygon;
+                selectedAnnoIdx = -1;
+                selectedPointIdx = -1;
+                renderCanvas();
+                renderObjectList();
+                triggerAutoSave(); 
+            }
+        }
+
+        function setupEvents() {
+            window.addEventListener('keydown', (e) => {
+                if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+                const key = e.key.toLowerCase();
+                
+                if (e.ctrlKey || e.metaKey) {
+                    if (key === 's') { e.preventDefault(); saveAnnotations(false); return; }
+                    if (key === 'z') { e.preventDefault(); undo(); return; }
+                    return;
+                }
+                if (e.shiftKey && e.key === 'Delete') { e.preventDefault(); deleteCurrentImage(); return; }
+
+                switch (key) {
+                    case 'd': navigateImage(-1); break;
+                    case 'f': navigateImage(1); break;
+                    case 'n': setMode('draw'); break;
+                    case 'v': setMode('select'); break;
+                    case 'enter': if (mode === 'draw' && currentPolygon.length >= 3) finishDrawing(); break;
+                    case 'escape': if (mode === 'draw') { currentPolygon = []; renderCanvas(); } break;
+                    case 'delete': case 'backspace': deleteSelection(); break;
+                }
+            });
+
+            canvas.addEventListener('contextmenu', e => e.preventDefault());
+            canvas.addEventListener('mousedown', onMouseDown);
+            canvas.addEventListener('mousemove', onMouseMove);
+            window.addEventListener('mouseup', onMouseUp);
+        }
+
+        // ================= 画布核心交互 =================
+
+        function getNormalizedPos(e) {
+            const rect = canvas.getBoundingClientRect();
+            return [
+                Math.max(0, Math.min(1, (e.clientX - rect.left) / canvas.width)),
+                Math.max(0, Math.min(1, (e.clientY - rect.top) / canvas.height))
+            ];
+        }
+
+        function onMouseDown(e) {
+            if (e.button !== 0) return;
+            const pt = getNormalizedPos(e);
+
+            if (mode === 'draw') {
+                saveState();
+                currentPolygon.push(pt);
+                renderCanvas();
+            } 
+            else if (mode === 'select') {
+                const pointHit = findPoint(pt);
+                if (pointHit) {
+                    saveState();
+                    selectedAnnoIdx = pointHit.annoIdx;
+                    selectedPointIdx = pointHit.pointIdx;
+                    isDraggingPoint = true;
+                    renderCanvas();
+                    renderObjectList();
+                    return;
+                }
+                const polyHit = findPolygon(pt);
+                if (polyHit !== -1) {
+                    selectedAnnoIdx = polyHit;
+                    selectedPointIdx = -1;
+                } else {
+                    selectedAnnoIdx = -1;
+                    selectedPointIdx = -1;
+                }
+                renderCanvas();
+                renderObjectList();
+            }
+        }
+
+        function onMouseMove(e) {
+            const pt = getNormalizedPos(e);
+            mousePos = pt;
+
+            if (mode === 'draw' && currentPolygon.length > 0) {
+                renderCanvas();
+            } 
+            else if (mode === 'select') {
+                if (isDraggingPoint && selectedAnnoIdx !== -1 && selectedPointIdx !== -1) {
+                    annotations[selectedAnnoIdx].points[selectedPointIdx] = pt;
+                    renderCanvas();
+                } else {
+                    canvas.style.cursor = findPoint(pt) ? 'grab' : (findPolygon(pt) !== -1 ? 'pointer' : 'default');
+                }
+            }
+        }
+
+        function onMouseUp(e) { 
+            if (mode === 'select' && isDraggingPoint) {
+                isDraggingPoint = false;
+                triggerAutoSave(); 
+            }
+        }
+
+        function finishDrawing() {
+            saveState();
+            const cls = document.getElementById('class-select').value;
+            annotations.push({ cls: cls, points: [...currentPolygon], visible: true });
+            currentPolygon = [];
+            setMode('select');
+            selectedAnnoIdx = annotations.length - 1; 
+            renderCanvas();
+            renderObjectList();
+            triggerAutoSave(); 
+        }
+
+        function deleteSelection() {
+            if (mode !== 'select' || selectedAnnoIdx === -1) return;
+            saveState();
+            if (selectedPointIdx !== -1) {
+                annotations[selectedAnnoIdx].points.splice(selectedPointIdx, 1);
+                selectedPointIdx = -1;
+                if (annotations[selectedAnnoIdx].points.length < 3) {
+                    annotations.splice(selectedAnnoIdx, 1);
+                    selectedAnnoIdx = -1;
+                }
+            } else {
+                annotations.splice(selectedAnnoIdx, 1);
+                selectedAnnoIdx = -1;
+            }
+            renderCanvas();
+            renderObjectList();
+            triggerAutoSave(); 
+        }
+
+        function findPoint(pt) {
+            const threshold = 6 / canvas.width; 
+            for (let i = annotations.length - 1; i >= 0; i--) {
+                if(!annotations[i].visible) continue; 
+                const points = annotations[i].points;
+                for (let j = 0; j < points.length; j++) {
+                    if (Math.hypot(points[j][0] - pt[0], points[j][1] - pt[1]) < threshold) 
+                        return { annoIdx: i, pointIdx: j };
+                }
+            }
+            return null;
+        }
+
+        function findPolygon(pt) {
+            for (let i = annotations.length - 1; i >= 0; i--) {
+                if(!annotations[i].visible) continue; 
+                if (isPointInPolygon(pt, annotations[i].points)) return i;
+            }
+            return -1;
+        }
+
+        function isPointInPolygon(point, vs) {
+            let x = point[0], y = point[1], inside = false;
+            for (let i = 0, j = vs.length - 1; i < vs.length; j = i++) {
+                let xi = vs[i][0], yi = vs[i][1], xj = vs[j][0], yj = vs[j][1];
+                let intersect = ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+                if (intersect) inside = !inside;
+            }
+            return inside;
+        }
+
+        // ================= 渲染层 =================
+
+        function updateClassSelector() {
+            const select = document.getElementById('class-select');
+            if (selectedAnnoIdx !== -1 && annotations[selectedAnnoIdx]) {
+                select.value = annotations[selectedAnnoIdx].cls;
+            }
+        }
+
+        function onClassChange() {
+            const newCls = document.getElementById('class-select').value;
+            if (mode === 'select' && selectedAnnoIdx !== -1) {
+                saveState();
+                annotations[selectedAnnoIdx].cls = newCls;
+                renderCanvas();
+                renderObjectList();
+                triggerAutoSave(); 
+            }
+        }
+
+        function resizeCanvas() {
+            if (currentIndex === -1) return;
+            canvas.width = imgEl.clientWidth;
+            canvas.height = imgEl.clientHeight;
+            renderCanvas();
+        }
+
+        imgEl.onload = () => {
+            resizeCanvas();
+            document.getElementById('image-wrapper').style.display = 'inline-block';
+            renderObjectList();
+        };
+
+        function toPixel(pt) { return [pt[0] * canvas.width, pt[1] * canvas.height]; }
+
+        function renderCanvas() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            annotations.forEach((ann, idx) => {
+                if (!ann.visible) return; 
+                
+                const isSelected = (idx === selectedAnnoIdx);
+                const isHovered = (idx === hoveredAnnoIdx); 
+                
+                drawPolygon(ann.points, ann.cls, true, isSelected, isHovered);
+                
+                if (isSelected) {
+                    ann.points.forEach((pt, pIdx) => drawPoint(pt, pIdx === selectedPointIdx ? 'yellow' : 'white'));
+                }
+            });
+
+            if (mode === 'draw' && currentPolygon.length > 0) {
+                const drawPts = [...currentPolygon];
+                if (mousePos) drawPts.push(mousePos);
+                drawPolygon(drawPts, document.getElementById('class-select').value, false, false, false);
+                currentPolygon.forEach(pt => drawPoint(pt, 'white'));
+            }
+        }
+
+        function drawPoint(pt, fillColor) {
+            const p = toPixel(pt);
+            ctx.beginPath();
+            ctx.arc(p[0], p[1], fillColor === 'yellow' ? 6 : 4, 0, Math.PI * 2);
+            ctx.fillStyle = fillColor;
+            ctx.fill();
+            ctx.strokeStyle = '#000'; ctx.lineWidth = 1; ctx.stroke();
+        }
+
+        function drawPolygon(points, cls, isFinished, isSelected, isHovered) {
+            if (points.length === 0) return;
+            const color = colors[parseInt(cls) % colors.length || 0];
+
+            ctx.beginPath();
+            const start = toPixel(points[0]);
+            ctx.moveTo(start[0], start[1]);
+            for (let i = 1; i < points.length; i++) {
+                const p = toPixel(points[i]);
+                ctx.lineTo(p[0], p[1]);
+            }
+            if (isFinished) ctx.closePath();
+
+            ctx.lineWidth = (isSelected || isHovered) ? 3 : 2;
+            ctx.strokeStyle = isSelected ? '#fff' : (isHovered ? '#fff' : color); 
+            
+            if (isSelected || isHovered) { 
+                ctx.shadowColor = isHovered ? color : '#000'; 
+                ctx.shadowBlur = isHovered ? 8 : 4; 
+            }
+            ctx.stroke();
+            ctx.shadowBlur = 0; 
+
+            if (isFinished) {
+                ctx.fillStyle = color + (isSelected ? "60" : (isHovered ? "40" : "25")); 
+                ctx.fill();
+                const labelName = classesData[cls] || cls;
+                ctx.fillStyle = (isSelected || isHovered) ? '#fff' : color;
+                ctx.font = "bold 14px sans-serif";
+                ctx.shadowColor = '#000'; ctx.shadowBlur = 3;
+                ctx.fillText(`${labelName}`, start[0] + 8, start[1] + 15);
+                ctx.shadowBlur = 0;
+            }
+        }
+
+        // ================= API 请求与自动保存 =================
+
+        function triggerAutoSave() {
+            if (autoSaveTimer) clearTimeout(autoSaveTimer);
+            const btn = document.getElementById('btn-save');
+            btn.innerText = "⏳ 保存中...";
+            btn.className = "btn-primary btn-save saving";
+            
+            autoSaveTimer = setTimeout(() => {
+                saveAnnotations(true);
+                autoSaveTimer = null; 
+            }, 500); 
+        }
+
+        async function saveAnnotations(isAuto = false) {
+            if (currentIndex === -1) return;
+            const img = imagesData[currentIndex];
+            const btn = document.getElementById('btn-save');
+            
+            if (!isAuto) {
+                btn.innerText = "⏳ 保存中...";
+                btn.className = "btn-primary btn-save saving";
+            }
+
+            const payloadData = annotations.map(a => ({ cls: a.cls, points: a.points }));
+            
+            try {
+                const response = await fetch(`/api/annotations/${img.id}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ annotations: payloadData })
+                });
+                if (response.ok) {
+                    img.hasLabel = true; 
+                    updateNavigationUI(); 
+                    btn.innerText = "✅ 已保存";
+                    btn.className = "btn-primary btn-save";
+                }
+            } catch (e) { 
+                btn.innerText = "❌ 保存失败";
+                btn.style.background = "#ff4d4f";
+                if(!isAuto) alert("保存失败，请检查后端运行状态"); 
+            }
+        }
+
+        async function fetchClasses() {
+            try {
+                const res = await fetch('/api/classes');
+                if (res.ok) {
+                    classesData = (await res.json()).classes || {};
+                    const select = document.getElementById('class-select');
+                    select.innerHTML = '';
+                    for (const [key, val] of Object.entries(classesData)) {
+                        select.innerHTML += `<option value="${key}">${key} (${val})</option>`;
+                    }
+                }
+            } catch (e) {}
+        }
+
+        async function fetchImagesList() {
+            try {
+                const response = await fetch('/api/images');
+                if (response.ok) {
+                    imagesData = (await response.json()).images;
+                    if(imagesData.length > 0 && currentIndex === -1) {
+                        // 寻找浏览器记忆的上一张图
+                        const savedId = localStorage.getItem('voc_last_image_id');
+                        let startIdx = 0;
+                        if (savedId) {
+                            const foundIdx = imagesData.findIndex(img => img.id === savedId);
+                            if (foundIdx !== -1) startIdx = foundIdx;
+                        }
+                        selectImage(startIdx); 
+                    } 
+                    else {
+                        updateNavigationUI();
+                    }
+                }
+            } catch (error) {}
+        }
+
+        async function importDataset() {
+            const path = document.getElementById('dataset-path').value.trim();
+            if (!path) return alert("路径不能为空！");
+            document.getElementById('dataset-status').innerText = "⏳ 加载中...";
             try {
                 const response = await fetch('/api/dataset', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ path: pathInput })
+                    body: JSON.stringify({ path })
                 });
-
-                if (!response.ok) {
-                    const errorMsg = await response.text();
-                    throw new Error(errorMsg || "数据集结构错误");
-                }
-
-                const data = await response.json();
-                statusEl.innerText = `✅ 导入成功！共加载 ${data.dataset.imageCount} 张图片`;
-                statusEl.style.color = "#52c41a";
-                
-                // 刷新图片列表
+                if (!response.ok) throw new Error(await response.text());
+                document.getElementById('dataset-status').innerText = "✅ 成功";
+                currentIndex = -1; 
                 fetchImagesList();
-                
-            } catch (error) {
-                statusEl.innerText = `❌ 导入失败: ${error.message}`;
-                statusEl.style.color = "#ff4d4f";
-                alert(error.message);
-            }
+            } catch (error) { alert("导入失败: " + error.message); }
         }
 
-        // 2. 获取数据集当前配置路径
         async function fetchDatasetInfo() {
             try {
                 const res = await fetch('/api/dataset');
                 if (res.ok) {
                     const data = await res.json();
-                    if(data.dataset && data.dataset.path) {
-                        document.getElementById('dataset-path').value = data.dataset.path;
+                    if(data.dataset && data.dataset.path) document.getElementById('dataset-path').value = data.dataset.path;
+                }
+            } catch (e) {}
+        }
+
+        async function deleteCurrentImage() {
+            if (currentIndex === -1) return;
+            
+            // 删图前清空幽灵定时器
+            if (autoSaveTimer) {
+                clearTimeout(autoSaveTimer);
+                autoSaveTimer = null;
+            }
+
+            if (!confirm("⚠️ 确定要将图片移动到回收站吗？")) return;
+            const img = imagesData[currentIndex];
+            try {
+                const response = await fetch(`/api/images/${img.id}`, { method: 'DELETE' });
+                if (response.ok) {
+                    imagesData.splice(currentIndex, 1);
+                    if (imagesData.length === 0) {
+                        currentIndex = -1;
+                        document.getElementById('image-wrapper').style.display = 'none';
+                        updateNavigationUI();
+                    } else {
+                        let nextIdx = currentIndex >= imagesData.length ? imagesData.length - 1 : currentIndex;
+                        selectImage(nextIdx);
                     }
                 }
-            } catch (e) {
-                console.error("获取数据集信息失败", e);
-            }
-        }
-
-        // 3. 获取并渲染图片列表
-        async function fetchImagesList() {
-            try {
-                const response = await fetch('/api/images');
-                if (!response.ok) return;
-                
-                const data = await response.json();
-                imagesData = data.images;
-                
-                document.getElementById('image-count').innerText = `(${imagesData.length})`;
-                renderImageList();
-            } catch (error) {
-                console.error("加载图片列表失败:", error);
-            }
-        }
-
-        function renderImageList() {
-            const listEl = document.getElementById('image-list');
-            listEl.innerHTML = '';
-
-            imagesData.forEach(img => {
-                const li = document.createElement('li');
-                li.id = `item-${img.id}`;
-                li.onclick = () => selectImage(img);
-                
-                const statusHtml = img.hasLabel 
-                    ? `<span class="status-badge status-labeled">已标</span>` 
-                    : `<span class="status-badge status-unlabeled">未标</span>`;
-
-                li.innerHTML = `
-                    <span class="file-name" title="${img.filename}">${img.filename}</span>
-                    ${statusHtml}
-                `;
-                
-                // 保持选中状态
-                if (currentImageId === img.id) {
-                    li.classList.add('active');
-                }
-                
-                listEl.appendChild(li);
-            });
-        }
-
-        // 4. 选中单张图片
-        async function selectImage(img) {
-            currentImageId = img.id;
-            
-            // 更新列表 UI 选中状态
-            document.querySelectorAll('.image-list li').forEach(li => li.classList.remove('active'));
-            document.getElementById(`item-${img.id}`).classList.add('active');
-            
-            // 更新主工作区
-            document.getElementById('empty-text').style.display = 'none';
-            const imgEl = document.getElementById('main-image');
-            imgEl.src = img.imageUrl;
-            imgEl.style.display = 'block';
-            
-            document.getElementById('current-image-name').innerText = img.filename;
-            
-            // 启用删除按钮
-            document.getElementById('btn-delete').disabled = false;
-
-            // (预留) 获取具体标注数据并绘制多边形
-            // fetch(`/api/annotations/${img.id}`).then(...);
-        }
-
-        // 5. 删除当前图片 (红色按钮对应逻辑)
-        async function deleteCurrentImage() {
-            if (!currentImageId) return;
-            
-            if (!confirm("⚠️ 确定要将当前图片及其标注移动到废弃文件夹 (__delete__) 吗？此操作界面不可撤销！")) {
-                return;
-            }
-
-            try {
-                const response = await fetch(`/api/images/${currentImageId}`, {
-                    method: 'DELETE'
-                });
-                
-                if (!response.ok) throw new Error("删除请求失败");
-                
-                // 查找当前图片的索引，为了删除后自动跳转下一张
-                const currentIndex = imagesData.findIndex(img => img.id === currentImageId);
-                
-                // 重新拉取列表
-                await fetchImagesList();
-                
-                // 自动选择下一张 (如果还有的话)
-                if (imagesData.length > 0) {
-                    const nextIndex = currentIndex < imagesData.length ? currentIndex : imagesData.length - 1;
-                    selectImage(imagesData[nextIndex]);
-                } else {
-                    // 列表空了
-                    currentImageId = null;
-                    document.getElementById('main-image').style.display = 'none';
-                    document.getElementById('empty-text').style.display = 'block';
-                    document.getElementById('btn-delete').disabled = true;
-                    document.getElementById('current-image-name').innerText = '';
-                }
-                
-            } catch (error) {
-                alert("删除失败: " + error.message);
-            }
-        }
-
-        // 6. 导出 ZIP
-        function exportDataset() {
-            window.open('/api/export.zip', '_blank');
+            } catch (error) {}
         }
     </script>
 </body>
