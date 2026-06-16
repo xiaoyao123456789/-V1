@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>VOC Segmentation Annotator</title>
+    <style>
+        /* 基础样式重置 */
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; flex-direction: column; height: 100vh; background: #f0f2f5; }
+
+        /* 顶部区域 - 数据集导入 */
+        .header { padding: 15px 20px; background: white; border-bottom: 1px solid #ddd; display: flex; align-items: center; gap: 15px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+        .header h2 { font-size: 18px; color: #333; margin-right: 20px; }
+        .header input { flex: 1; max-width: 450px; padding: 8px 12px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
+        .header button { padding: 8px 16px; background: #1890ff; color: white; border: none; border-radius: 4px; cursor: pointer; transition: background 0.3s; }
+        .header button:hover { background: #40a9ff; }
+        #dataset-status { font-size: 14px; font-weight: bold; }
+
+        /* 主体布局 */
+        .main-container { display: flex; flex: 1; overflow: hidden; }
+
+        /* 左侧边栏 - 图片列表 */
+        .sidebar { width: 300px; background: white; border-right: 1px solid #ddd; display: flex; flex-direction: column; }
+        .sidebar h3 { padding: 15px; border-bottom: 1px solid #eee; margin: 0; font-size: 16px; display: flex; justify-content: space-between;}
+        .image-list { flex: 1; overflow-y: auto; list-style: none; }
+        .image-list li { padding: 12px 15px; cursor: pointer; border-bottom: 1px solid #f5f5f5; display: flex; justify-content: space-between; align-items: center; transition: background 0.2s; }
+        .image-list li:hover { background: #fafafa; }
+        .image-list li.active { background: #e6f7ff; border-right: 4px solid #1890ff; }
+        .file-name { font-size: 14px; color: #333; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px; }
+        .status-badge { font-size: 12px; padding: 2px 6px; border-radius: 10px; }
+        .status-labeled { background: #52c41a; color: white; }
+        .status-unlabeled { background: #d9d9d9; color: #666; }
+
+        /* 右侧工作区 */
+        .workspace { flex: 1; display: flex; flex-direction: column; padding: 20px; }
+        
+        /* 工具栏 */
+        .toolbar { margin-bottom: 15px; display: flex; gap: 12px; align-items: center; }
+
+        /* 🔥 醒目的红色删除按钮 */
+        .btn-delete { 
+            background-color: #ff4d4f; 
+            color: white; 
+            font-weight: bold; 
+            border: none; 
+            padding: 10px 20px; 
+            border-radius: 6px; 
+            cursor: pointer; 
+            transition: all 0.3s ease; 
+            font-size: 14px;
+        }
+        .btn-delete:hover:not(:disabled) { 
+            background-color: #ff7875; 
+            box-shadow: 0 4px 12px rgba(255, 77, 79, 0.4); 
+            transform: translateY(-1px);
+        }
+        .btn-delete:active:not(:disabled) { 
+            background-color: #d9363e; 
+            transform: translateY(0);
+        }
+        .btn-delete:disabled { 
+            background-color: #f5f5f5; 
+            color: #b8b8b8; 
+            cursor: not-allowed; 
+        }
+
+        .btn-export { background: #52c41a; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: bold; }
+        .btn-export:hover { background: #73d13d; }
+
+        /* 画布/图片显示区 */
+        .canvas-container { flex: 1; background: #e5e5e5; border: 2px dashed #bbb; border-radius: 8px; display: flex; justify-content: center; align-items: center; overflow: hidden; position: relative; box-shadow: inset 0 0 10px rgba(0,0,0,0.05); }
+        #main-image { max-width: 100%; max-height: 100%; display: none; object-fit: contain; }
+        .empty-text { color: #888; font-size: 18px; user-select: none; }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h2>VOC 标注平台</h2>
+        <input type="text" id="dataset-path" placeholder="请输入本地数据集绝对路径 (需包含 images 和 labels 文件夹)">
+        <button onclick="importDataset()">加载数据集</button>
+        <span id="dataset-status"></span>
+    </div>
+
+    <div class="main-container">
+        <div class="sidebar">
+            <h3>图片列表 <span id="image-count" style="font-size: 13px; color: #888; font-weight: normal;">(0)</span></h3>
+            <ul class="image-list" id="image-list">
+                </ul>
+        </div>
+
+        <div class="workspace">
+            <div class="toolbar">
+                <button id="btn-delete" class="btn-delete" onclick="deleteCurrentImage()" disabled>
+                    🗑️ 删除当前图 (及其标签)
+                </button>
+                <button class="btn-export" onclick="exportDataset()">📦 导出 ZIP</button>
+                <span id="current-image-name" style="margin-left: auto; color: #666; font-weight: bold;"></span>
+            </div>
+
+            <div class="canvas-container" id="canvas-container">
+                <span class="empty-text" id="empty-text">请在左侧选择一张图片，或在上方导入数据集</span>
+                <img id="main-image" src="" alt="当前标注图片">
+                </div>
+        </div>
+    </div>
+
+    <script>
+        let currentImageId = null;
+        let imagesData = [];
+
+        // 页面加载时自动获取当前数据集列表
+        window.onload = () => {
+            fetchImagesList();
+            fetchDatasetInfo();
+        };
+
+        // 1. 导入数据集逻辑
+        async function importDataset() {
+            const pathInput = document.getElementById('dataset-path').value.trim();
+            const statusEl = document.getElementById('dataset-status');
+            
+            if (!pathInput) {
+                alert("路径不能为空！");
+                return;
+            }
+
+            statusEl.innerText = "⏳ 校验并加载中...";
+            statusEl.style.color = "#1890ff";
+
+            try {
+                const response = await fetch('/api/dataset', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path: pathInput })
+                });
+
+                if (!response.ok) {
+                    const errorMsg = await response.text();
+                    throw new Error(errorMsg || "数据集结构错误");
+                }
+
+                const data = await response.json();
+                statusEl.innerText = `✅ 导入成功！共加载 ${data.dataset.imageCount} 张图片`;
+                statusEl.style.color = "#52c41a";
+                
+                // 刷新图片列表
+                fetchImagesList();
+                
+            } catch (error) {
+                statusEl.innerText = `❌ 导入失败: ${error.message}`;
+                statusEl.style.color = "#ff4d4f";
+                alert(error.message);
+            }
+        }
+
+        // 2. 获取数据集当前配置路径
+        async function fetchDatasetInfo() {
+            try {
+                const res = await fetch('/api/dataset');
+                if (res.ok) {
+                    const data = await res.json();
+                    if(data.dataset && data.dataset.path) {
+                        document.getElementById('dataset-path').value = data.dataset.path;
+                    }
+                }
+            } catch (e) {
+                console.error("获取数据集信息失败", e);
+            }
+        }
+
+        // 3. 获取并渲染图片列表
+        async function fetchImagesList() {
+            try {
+                const response = await fetch('/api/images');
+                if (!response.ok) return;
+                
+                const data = await response.json();
+                imagesData = data.images;
+                
+                document.getElementById('image-count').innerText = `(${imagesData.length})`;
+                renderImageList();
+            } catch (error) {
+                console.error("加载图片列表失败:", error);
+            }
+        }
+
+        function renderImageList() {
+            const listEl = document.getElementById('image-list');
+            listEl.innerHTML = '';
+
+            imagesData.forEach(img => {
+                const li = document.createElement('li');
+                li.id = `item-${img.id}`;
+                li.onclick = () => selectImage(img);
+                
+                const statusHtml = img.hasLabel 
+                    ? `<span class="status-badge status-labeled">已标</span>` 
+                    : `<span class="status-badge status-unlabeled">未标</span>`;
+
+                li.innerHTML = `
+                    <span class="file-name" title="${img.filename}">${img.filename}</span>
+                    ${statusHtml}
+                `;
+                
+                // 保持选中状态
+                if (currentImageId === img.id) {
+                    li.classList.add('active');
+                }
+                
+                listEl.appendChild(li);
+            });
+        }
+
+        // 4. 选中单张图片
+        async function selectImage(img) {
+            currentImageId = img.id;
+            
+            // 更新列表 UI 选中状态
+            document.querySelectorAll('.image-list li').forEach(li => li.classList.remove('active'));
+            document.getElementById(`item-${img.id}`).classList.add('active');
+            
+            // 更新主工作区
+            document.getElementById('empty-text').style.display = 'none';
+            const imgEl = document.getElementById('main-image');
+            imgEl.src = img.imageUrl;
+            imgEl.style.display = 'block';
+            
+            document.getElementById('current-image-name').innerText = img.filename;
+            
+            // 启用删除按钮
+            document.getElementById('btn-delete').disabled = false;
+
+            // (预留) 获取具体标注数据并绘制多边形
+            // fetch(`/api/annotations/${img.id}`).then(...);
+        }
+
+        // 5. 删除当前图片 (红色按钮对应逻辑)
+        async function deleteCurrentImage() {
+            if (!currentImageId) return;
+            
+            if (!confirm("⚠️ 确定要将当前图片及其标注移动到废弃文件夹 (__delete__) 吗？此操作界面不可撤销！")) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/images/${currentImageId}`, {
+                    method: 'DELETE'
+                });
+                
+                if (!response.ok) throw new Error("删除请求失败");
+                
+                // 查找当前图片的索引，为了删除后自动跳转下一张
+                const currentIndex = imagesData.findIndex(img => img.id === currentImageId);
+                
+                // 重新拉取列表
+                await fetchImagesList();
+                
+                // 自动选择下一张 (如果还有的话)
+                if (imagesData.length > 0) {
+                    const nextIndex = currentIndex < imagesData.length ? currentIndex : imagesData.length - 1;
+                    selectImage(imagesData[nextIndex]);
+                } else {
+                    // 列表空了
+                    currentImageId = null;
+                    document.getElementById('main-image').style.display = 'none';
+                    document.getElementById('empty-text').style.display = 'block';
+                    document.getElementById('btn-delete').disabled = true;
+                    document.getElementById('current-image-name').innerText = '';
+                }
+                
+            } catch (error) {
+                alert("删除失败: " + error.message);
+            }
+        }
+
+        // 6. 导出 ZIP
+        function exportDataset() {
+            window.open('/api/export.zip', '_blank');
+        }
+    </script>
+</body>
+</html>
