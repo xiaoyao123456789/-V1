@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VOC Segmentation Annotator (CVAT Style)</title>
+  <link rel="stylesheet" href="/static/annotator.css?v=20260616b">
+</head>
+<body>
+  <div class="header">
+    <div class="header-left">
+      <a id="annotatorHomeLink" class="brand-link" href="/">yicun</a>
+    </div>
+
+    <div class="header-right">
+      <div class="toolbar-group">
+        <span id="mode-badge" class="mode-indicator mode-select">格式: SEG · 状态: 选择</span>
+        <span id="zoom-badge" class="zoom-badge">100%</span>
+        <button id="btn-save" class="btn-primary btn-save" type="button">💾 已保存</button>
+        <button id="delete-current-btn" class="btn-primary btn-danger" type="button">🗑️ 删图 (Shift+Del)</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="nav-bar">
+    <button class="nav-btn" id="btn-prev" type="button" disabled>◀ 快捷键 D</button>
+    <div class="image-info" id="image-info-container">
+      <span id="image-counter" title="点击跳转到指定页">0 / 0</span>
+      <span id="current-image-name" class="current-image-name">---</span>
+      <span id="image-status-badge"></span>
+    </div>
+    <button class="nav-btn" id="btn-next" type="button" disabled>快捷键 F ▶</button>
+  </div>
+
+  <div class="main-container">
+    <div class="canvas-area" id="canvas-container">
+      <span class="empty-text" id="empty-text">请导入数据集</span>
+      <div class="image-wrapper" id="image-wrapper" hidden>
+        <img id="main-image" src="" alt="">
+        <canvas id="draw-canvas"></canvas>
+      </div>
+      <div id="class-popup" class="class-popup" hidden></div>
+    </div>
+
+    <div class="right-sidebar">
+      <div class="sidebar-header">
+        <span>Objects (图层)</span>
+        <span id="object-count" class="sidebar-count">0</span>
+      </div>
+
+      <ul class="object-list" id="object-list"></ul>
+
+      <div class="sidebar-footer">
+        <label class="footer-label" for="class-select">修改选中对象的类别:</label>
+        <select id="class-select"></select>
+        <div class="footer-tip">
+          提示: 增删改及拖拽点后会自动保存。<br>
+          <b>N</b>: 开始绘制 | <b>Enter</b>: 完成 SEG<br>
+          OBB: 第一下定起点，第二下定方向，第三下向左/右补宽成框<br>
+          <b>Del</b>: 删除选中 | <b>Ctrl+Z</b>: 撤销
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/annotator.js?v=20260616b"></script>
+</body>
+</html>

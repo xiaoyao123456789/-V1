@@ -40,10 +40,17 @@ const el = {
   classList: document.querySelector("#classList"),
   addClass: document.querySelector("#addClassBtn"),
   saveClasses: document.querySelector("#saveClassesBtn"),
+  projectContext: document.querySelector("#projectContext"),
+  packageContext: document.querySelector("#packageContext"),
+  backToPanelLink: document.querySelector("#backToPanelLink"),
 };
 
 function setStatus(text) {
   el.status.textContent = text;
+}
+
+function pageParams() {
+  return new URLSearchParams(window.location.search);
 }
 
 function currentItem() {
@@ -145,6 +152,32 @@ async function loadImages() {
     await loadImage(0);
   } else {
     setStatus("未找到图片");
+  }
+}
+
+async function activatePackageFromQuery() {
+  const params = pageParams();
+  const projectId = params.get("projectId");
+  const packageId = params.get("packageId");
+
+  const projectName = params.get("projectName");
+  const packageName = params.get("packageName");
+  if (projectName && el.projectContext) el.projectContext.textContent = projectName;
+  if (packageName && el.packageContext) {
+    el.packageContext.textContent = packageName;
+    document.title = `${packageName} - 标注器`;
+  }
+  if (projectId && el.backToPanelLink) {
+    el.backToPanelLink.href = `/#/project/${encodeURIComponent(projectId)}`;
+  }
+
+  if (!projectId || !packageId) return;
+
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/packages/${encodeURIComponent(packageId)}/activate`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new Error("激活数据包失败");
   }
 }
 
@@ -718,7 +751,9 @@ el.download.addEventListener("click", downloadCurrent);
 el.addClass.addEventListener("click", addClass);
 el.saveClasses.addEventListener("click", saveClasses);
 
-loadImages().catch((error) => {
+activatePackageFromQuery()
+  .then(loadImages)
+  .catch((error) => {
   console.error(error);
   setStatus("加载失败");
 });

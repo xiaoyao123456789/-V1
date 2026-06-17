@@ -3,61 +3,130 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import os
 import posixpath
+import shutil
+import socket
 import sys
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, unquote, urljoin, urlparse
+from urllib.request import Request, urlopen
+from uuid import uuid4
 from zipfile import ZIP_DEFLATED, ZipFile
 
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
+CONFIG_DIR = ROOT / "config"
 DEFAULT_DATASET_DIR = ROOT / "data"
-DATASET_FILE = ROOT / ".dataset.json"
+DATASET_FILE = CONFIG_DIR / "dataset.json"
+PROJECTS_FILE = CONFIG_DIR / "projects.json"
+TEAM_FILE = CONFIG_DIR / "team.json"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
-def dataset_dir() -> Path:
-    if not DATASET_FILE.exists():
-        return DEFAULT_DATASET_DIR
+def read_json_file(path: Path, fallback):
+    if not path.exists():
+        return fallback
     try:
-        data = json.loads(DATASET_FILE.read_text(encoding="utf-8"))
-        path = Path(str(data.get("path", ""))).expanduser()
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return DEFAULT_DATASET_DIR
+        return fallback
+
+
+def write_json_file(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def resolve_dataset_path(raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
     if not path.is_absolute():
         path = (ROOT / path).resolve()
-    return path if path.exists() else DEFAULT_DATASET_DIR
+    return path
+
+
+def current_dataset_config() -> dict:
+    raw = read_json_file(DATASET_FILE, {})
+    if not isinstance(raw, dict):
+        raw = {}
+
+    if "images" in raw and "labels" in raw:
+        images = resolve_dataset_path(str(raw.get("images", "")))
+        labels = resolve_dataset_path(str(raw.get("labels", "")))
+        return {
+            "mode": "split",
+            "images": str(images),
+            "labels": str(labels),
+        }
+
+    root = resolve_dataset_path(str(raw.get("path", DEFAULT_DATASET_DIR)))
+    return {
+        "mode": "root",
+        "path": str(root),
+    }
+
+
+def dataset_root() -> Path:
+    config = current_dataset_config()
+    if config["mode"] == "root":
+        return Path(config["path"])
+    return label_dir().parent
 
 
 def image_dir() -> Path:
-    return dataset_dir() / "images"
+    config = current_dataset_config()
+    if config["mode"] == "split":
+        return Path(config["images"])
+    return Path(config["path"]) / "images"
 
 
 def label_dir() -> Path:
-    return dataset_dir() / "labels"
+    config = current_dataset_config()
+    if config["mode"] == "split":
+        return Path(config["labels"])
+    return Path(config["path"]) / "labels"
 
 
 def class_file() -> Path:
-    return dataset_dir() / "classes.json"
+    config = current_dataset_config()
+    if config["mode"] == "split":
+        return label_dir().parent / "classes.json"
+    return Path(config["path"]) / "classes.json"
+
+
+def delete_base_dir() -> Path:
+    return label_dir().parent / "__delete__"
 
 
 def delete_image_dir() -> Path:
-    return dataset_dir() / "__delete__" / "images"
+    return delete_base_dir() / "images"
 
 
 def delete_label_dir() -> Path:
-    return dataset_dir() / "__delete__" / "labels"
+    return delete_base_dir() / "labels"
+
+
+def dataset_summary(images: Path, labels: Path, mode: str, root_path: Path | None = None) -> dict:
+    summary = {
+        "mode": mode,
+        "imagesPath": str(images),
+        "labelsPath": str(labels),
+    }
+    if mode == "root" and root_path is not None:
+        summary["path"] = str(root_path)
+    return summary
 
 
 def image_files() -> list[Path]:
     images = image_dir()
     if not images.exists():
         return []
-    return sorted(p for p in images.iterdir() if p.suffix.lower() in IMAGE_EXTS)
+    return sorted(p for p in images.iterdir() if p.suffix.lower() in IMAGE_EXTS and p.is_file())
 
 
 def find_image(item_id: str) -> Path | None:
@@ -110,30 +179,20 @@ def move_current_to_delete(item_id: str) -> dict:
         moved["label"] = display_path(label_target)
     else:
         moved["label"] = None
+
     return moved
 
 
-def resolve_dataset_path(raw_path: str) -> Path:
-    path = Path(raw_path).expanduser()
-    if not path.is_absolute():
-        path = (ROOT / path).resolve()
-    return path
-
-
-def validate_dataset(path: Path) -> dict:
-    if not path.exists() or not path.is_dir():
-        raise ValueError("数据集目录不存在")
-    images = path / "images"
-    labels = path / "labels"
+def validate_dataset_paths(images: Path, labels: Path, mode: str = "split", root_path: Path | None = None) -> dict:
     if not images.exists() or not images.is_dir():
-        raise ValueError("数据集目录下缺少 images 文件夹")
+        raise ValueError("图片目录不存在")
     if not labels.exists() or not labels.is_dir():
-        raise ValueError("数据集目录下缺少 labels 文件夹")
+        raise ValueError("标签目录不存在")
 
     image_map = {p.stem: p for p in images.iterdir() if p.suffix.lower() in IMAGE_EXTS and p.is_file()}
     label_map = {p.stem: p for p in labels.iterdir() if p.suffix.lower() == ".txt" and p.is_file()}
     if not image_map:
-        raise ValueError("images 文件夹里没有可用图片")
+        raise ValueError("图片目录里没有可用图片")
 
     missing_labels = sorted(set(image_map) - set(label_map))
     extra_labels = sorted(set(label_map) - set(image_map))
@@ -145,17 +204,56 @@ def validate_dataset(path: Path) -> dict:
             detail.append(f"多余标签 {len(extra_labels)} 个，例如 {extra_labels[0]}")
         raise ValueError("图片和标签文件名没有一一对应：" + "；".join(detail))
 
-    return {
-        "path": str(path),
-        "imageCount": len(image_map),
-        "labelCount": len(label_map),
-    }
+    summary = dataset_summary(images, labels, mode=mode, root_path=root_path)
+    summary["imageCount"] = len(image_map)
+    summary["labelCount"] = len(label_map)
+    return summary
+
+
+def summarize_unlabeled_dataset(images: Path, labels: Path, mode: str = "split", root_path: Path | None = None) -> dict:
+    if not images.exists() or not images.is_dir():
+        raise ValueError("图片目录不存在")
+    image_map = {p.stem: p for p in images.iterdir() if p.suffix.lower() in IMAGE_EXTS and p.is_file()}
+    if not image_map:
+        raise ValueError("图片目录里没有可用图片")
+
+    labels.mkdir(parents=True, exist_ok=True)
+    label_map = {p.stem: p for p in labels.iterdir() if p.suffix.lower() == ".txt" and p.is_file()}
+    summary = dataset_summary(images, labels, mode=mode, root_path=root_path)
+    summary["imageCount"] = len(image_map)
+    summary["labelCount"] = len(label_map)
+    return summary
+
+
+def validate_dataset(path: Path) -> dict:
+    if not path.exists() or not path.is_dir():
+        raise ValueError("数据集目录不存在")
+    return validate_dataset_paths(path / "images", path / "labels", mode="root", root_path=path)
 
 
 def set_dataset(path: Path) -> dict:
     summary = validate_dataset(path)
-    DATASET_FILE.write_text(json.dumps({"path": str(path)}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_json_file(DATASET_FILE, {"path": str(path)})
     return summary
+
+
+def set_dataset_paths(images: Path, labels: Path) -> dict:
+    summary = validate_dataset_paths(images, labels)
+    write_json_file(DATASET_FILE, {"images": str(images), "labels": str(labels)})
+    return summary
+
+
+def set_dataset_paths_unchecked(images: Path, labels: Path) -> dict:
+    summary = summarize_unlabeled_dataset(images, labels)
+    write_json_file(DATASET_FILE, {"images": str(images), "labels": str(labels)})
+    return summary
+
+
+def validate_current_dataset() -> dict:
+    config = current_dataset_config()
+    if config["mode"] == "root":
+        return validate_dataset(Path(config["path"]))
+    return validate_dataset_paths(image_dir(), label_dir(), mode="split")
 
 
 def read_classes() -> dict[str, str]:
@@ -172,7 +270,7 @@ def read_classes() -> dict[str, str]:
 
 
 def write_classes(classes: dict) -> None:
-    dataset_dir().mkdir(parents=True, exist_ok=True)
+    class_file().parent.mkdir(parents=True, exist_ok=True)
     normalized = {}
     for key, value in classes.items():
         cls = str(key).strip()
@@ -191,7 +289,13 @@ def parse_label(path: Path) -> list[dict]:
         parts = line.strip().split()
         if not parts:
             continue
-        cls = parts[0]
+        header = parts[0]
+        if "|" in header:
+            format_name, cls = header.split("|", 1)
+            format_name = format_name.strip().lower()
+        else:
+            cls = header
+            format_name = "seg"
         coords = parts[1:]
         if len(coords) < 6 or len(coords) % 2:
             print(f"Skip invalid label line {path}:{line_no}", file=sys.stderr)
@@ -204,17 +308,56 @@ def parse_label(path: Path) -> list[dict]:
         except ValueError:
             print(f"Skip non-numeric label line {path}:{line_no}", file=sys.stderr)
             continue
-        annotations.append({"cls": cls, "points": points})
+        annotations.append({
+            "cls": cls,
+            "format": infer_annotation_format(points, format_name),
+            "points": points,
+        })
     return annotations
+
+
+def is_axis_aligned_box(points: list[list[float]]) -> bool:
+    if len(points) != 4:
+        return False
+    xs = {round(float(point[0]), 6) for point in points}
+    ys = {round(float(point[1]), 6) for point in points}
+    return len(xs) == 2 and len(ys) == 2
+
+
+def infer_annotation_format(points: list[list[float]], fallback: str = "seg") -> str:
+    normalized_fallback = str(fallback).strip().lower()
+    if normalized_fallback in {"hbb", "obb"}:
+        return normalized_fallback
+    if len(points) == 4:
+        return "hbb" if is_axis_aligned_box(points) else "obb"
+    return "seg"
 
 
 def serialize_label(annotations: list[dict]) -> str:
     lines = []
     for annotation in annotations:
         cls = str(annotation.get("cls", "0")).strip() or "0"
+        format_name = str(annotation.get("format", "seg")).strip().lower()
         points = annotation.get("points", [])
         if len(points) < 3:
             continue
+        if format_name == "hbb":
+            xs = [float(point[0]) for point in points if isinstance(point, (list, tuple)) and len(point) == 2]
+            ys = [float(point[1]) for point in points if isinstance(point, (list, tuple)) and len(point) == 2]
+            if not xs or not ys:
+                continue
+            min_x, max_x = min(xs), max(xs)
+            min_y, max_y = min(ys), max(ys)
+            points = [
+                [min_x, min_y],
+                [max_x, min_y],
+                [max_x, max_y],
+                [min_x, max_y],
+            ]
+        elif format_name == "obb":
+            points = list(points[:4])
+            if len(points) != 4:
+                continue
         chunks = [cls]
         for point in points:
             if not isinstance(point, (list, tuple)) or len(point) != 2:
@@ -237,42 +380,256 @@ def safe_join(base: Path, request_path: str) -> Path | None:
     return candidate
 
 
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def make_id(prefix: str) -> str:
+    return f"{prefix}_{uuid4().hex[:10]}"
+
+
+def default_projects_payload() -> dict:
+    return {"projects": []}
+
+
+def default_team_payload() -> dict:
+    return {"members": []}
+
+
+PACKAGE_STATUSES = {
+    "pending": "待标注",
+    "annotated": "已标注",
+    "reviewed": "已审核",
+    "used": "已使用",
+}
+ANNOTATION_FORMATS = {"seg", "hbb", "obb"}
+
+
+def normalize_package(raw: dict) -> dict:
+    images_path = str(raw.get("imagesPath", "")).strip()
+    labels_path = str(raw.get("labelsPath", "")).strip()
+    images = resolve_dataset_path(images_path) if images_path else None
+    labels = resolve_dataset_path(labels_path) if labels_path else None
+    return {
+        "id": str(raw.get("id") or make_id("pkg")),
+        "name": str(raw.get("name", "")).strip(),
+        "imagesPath": str(images) if images else "",
+        "labelsPath": str(labels) if labels else "",
+        "format": str(raw.get("format", "seg")).strip().lower() if str(raw.get("format", "seg")).strip().lower() in ANNOTATION_FORMATS else "seg",
+        "remark": str(raw.get("remark", "")).strip(),
+        "status": str(raw.get("status", "pending")) if str(raw.get("status", "pending")) in PACKAGE_STATUSES else "pending",
+        "imageCount": int(raw.get("imageCount", 0) or 0),
+        "labelCount": int(raw.get("labelCount", 0) or 0),
+        "createdAt": str(raw.get("createdAt") or now_iso()),
+        "updatedAt": str(raw.get("updatedAt") or raw.get("createdAt") or now_iso()),
+    }
+
+
+def first_image_in_dir(images_dir: Path) -> Path | None:
+    if not images_dir.exists() or not images_dir.is_dir():
+        return None
+    images = sorted(p for p in images_dir.iterdir() if p.suffix.lower() in IMAGE_EXTS and p.is_file())
+    return images[0] if images else None
+
+
+def normalize_project(raw: dict) -> dict:
+    packages = raw.get("packages", [])
+    if not isinstance(packages, list):
+        packages = []
+    return {
+        "id": str(raw.get("id") or make_id("proj")),
+        "name": str(raw.get("name", "")).strip(),
+        "description": str(raw.get("description", "")).strip(),
+        "createdAt": str(raw.get("createdAt") or now_iso()),
+        "updatedAt": str(raw.get("updatedAt") or raw.get("createdAt") or now_iso()),
+        "packages": [normalize_package(item) for item in packages if isinstance(item, dict)],
+    }
+
+
+def read_projects() -> dict:
+    payload = read_json_file(PROJECTS_FILE, default_projects_payload())
+    projects = payload.get("projects", []) if isinstance(payload, dict) else []
+    normalized = {"projects": [normalize_project(item) for item in projects if isinstance(item, dict)]}
+    if normalized != payload:
+        write_projects(normalized)
+    return normalized
+
+
+def write_projects(payload: dict) -> None:
+    write_json_file(PROJECTS_FILE, payload)
+
+
+def normalize_member(raw: dict) -> dict:
+    return {
+        "id": str(raw.get("id") or make_id("member")),
+        "name": str(raw.get("name", "")).strip(),
+        "ip": str(raw.get("ip", "")).strip(),
+        "username": str(raw.get("username", "")).strip(),
+        "password": str(raw.get("password", "")).strip(),
+        "homeUrl": str(raw.get("homeUrl", "")).strip(),
+        "remark": str(raw.get("remark", "")).strip(),
+        "createdAt": str(raw.get("createdAt") or now_iso()),
+        "updatedAt": str(raw.get("updatedAt") or raw.get("createdAt") or now_iso()),
+    }
+
+
+def read_team() -> dict:
+    payload = read_json_file(TEAM_FILE, default_team_payload())
+    members = payload.get("members", []) if isinstance(payload, dict) else []
+    normalized = {"members": [normalize_member(item) for item in members if isinstance(item, dict)]}
+    if normalized != payload:
+        write_team(normalized)
+    return normalized
+
+
+def write_team(payload: dict) -> None:
+    write_json_file(TEAM_FILE, payload)
+
+
+def find_project(payload: dict, project_id: str) -> dict | None:
+    for project in payload["projects"]:
+        if project["id"] == project_id:
+            return project
+    return None
+
+
+def find_package(project: dict, package_id: str) -> dict | None:
+    for package in project["packages"]:
+        if package["id"] == package_id:
+            return package
+    return None
+
+
+def find_member(payload: dict, member_id: str) -> dict | None:
+    for member in payload["members"]:
+        if member["id"] == member_id:
+            return member
+    return None
+
+
+def normalize_remote_base(url: str) -> str:
+    base = str(url).strip()
+    if not base:
+        raise ValueError("该成员还没有配置主页地址")
+    if not base.startswith(("http://", "https://")):
+        base = f"http://{base}"
+    return base.rstrip("/") + "/"
+
+
+def remote_request(member: dict, path: str, method: str = "GET", payload: dict | None = None) -> dict:
+    base = normalize_remote_base(member.get("homeUrl", ""))
+    url = urljoin(base, path.lstrip("/"))
+    data = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    request = Request(url, method=method, data=data, headers=headers)
+    try:
+        with urlopen(request, timeout=10) as response:
+            body = response.read().decode("utf-8")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore").strip()
+        raise ValueError(detail or f"远端请求失败: {exc.code}") from exc
+    except URLError as exc:
+        raise ValueError(f"无法访问远端服务：{exc.reason}") from exc
+
+    try:
+        parsed = json.loads(body or "{}")
+    except json.JSONDecodeError as exc:
+        raise ValueError("远端返回的数据不是有效 JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("远端返回的数据格式不正确")
+    return parsed
+
+
+def detect_local_ip() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+    except Exception:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return "127.0.0.1"
+
+
+def local_member_defaults(host: str, port: int) -> dict:
+    ip = detect_local_ip()
+    username = "user"
+    home_url = f"http://{ip}:{port}"
+    return {
+        "ip": ip,
+        "username": username,
+        "homeUrl": home_url,
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "VOCSegAnnotator/1.0"
+    server_version = "VOCSegAnnotator/1.1"
 
     def do_HEAD(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
+        if path == "/":
+            self.send_file(STATIC_DIR / "index.html", include_body=False)
+            return
+        if path == "/annotator":
+            self.send_file(STATIC_DIR / "annotator.html", include_body=False)
+            return
         if path.startswith("/static/"):
             target = safe_join(ROOT, path)
             self.send_file(target, include_body=False)
             return
-        if path.startswith("/data/"):
-            target = safe_join(dataset_dir(), path.removeprefix("/data/"))
+        if path.startswith("/data/images/"):
+            target = safe_join(image_dir(), path.removeprefix("/data/images/"))
             self.send_file(target, include_body=False)
             return
-        if path == "/":
-            self.send_file(STATIC_DIR / "index.html", include_body=False)
+        if path.startswith("/data/labels/"):
+            target = safe_join(label_dir(), path.removeprefix("/data/labels/"))
+            self.send_file(target, include_body=False)
             return
+        if path == "/data/classes.json":
+            self.send_file(class_file(), include_body=False)
+            return
+        if path.startswith("/api/projects/"):
+            parts = [unquote(part) for part in path.split("/") if part]
+            if len(parts) == 6 and parts[0] == "api" and parts[1] == "projects" and parts[3] == "packages" and parts[5] == "preview":
+                self.send_package_preview(parts[2], parts[4], include_body=False)
+                return
         self.send_error(404)
 
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
-        if not path.startswith("/api/images/"):
-            self.send_error(404)
+        if path.startswith("/api/images/"):
+            item_id = unquote(path.removeprefix("/api/images/"))
+            try:
+                moved = move_current_to_delete(item_id)
+            except FileNotFoundError:
+                self.send_error(404, "Image not found")
+                return
+            except Exception as exc:
+                self.send_error(400, str(exc))
+                return
+            self.send_json({"ok": True, "moved": moved})
             return
 
-        item_id = unquote(path.removeprefix("/api/images/"))
-        try:
-            moved = move_current_to_delete(item_id)
-        except FileNotFoundError:
-            self.send_error(404, "Image not found")
-            return
-        except Exception as exc:
-            self.send_error(400, str(exc))
-            return
-        self.send_json({"ok": True, "moved": moved})
+        if path.startswith("/api/projects/"):
+            parts = [unquote(part) for part in path.split("/") if part]
+            if len(parts) == 5 and parts[0] == "api" and parts[1] == "projects" and parts[3] == "packages":
+                self.delete_package(parts[2], parts[4])
+                return
+
+        if path.startswith("/api/team/"):
+            parts = [unquote(part) for part in path.split("/") if part]
+            if len(parts) == 3 and parts[0] == "api" and parts[1] == "team":
+                self.delete_member(parts[2])
+                return
+
+        self.send_error(404)
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -281,14 +638,53 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             self.send_file(STATIC_DIR / "index.html")
             return
+        if path == "/annotator":
+            self.send_file(STATIC_DIR / "annotator.html")
+            return
         if path == "/api/images":
-            self.send_json({"images": self.list_images(), "dataset": validate_dataset(dataset_dir())})
+            self.send_json({"images": self.list_images(), "dataset": validate_current_dataset()})
             return
         if path == "/api/dataset":
-            self.send_json({"dataset": validate_dataset(dataset_dir())})
+            self.send_json({"dataset": validate_current_dataset()})
             return
         if path == "/api/classes":
             self.send_json({"classes": read_classes()})
+            return
+        if path == "/api/projects":
+            self.send_json(read_projects())
+            return
+        if path == "/api/team":
+            self.send_json(read_team())
+            return
+        if path == "/api/team/defaults":
+            port = self.server.server_port if hasattr(self.server, "server_port") else 8000
+            self.send_json({"ok": True, "defaults": local_member_defaults("0.0.0.0", port)})
+            return
+        if path.startswith("/api/team/"):
+            parts = [unquote(part) for part in path.split("/") if part]
+            if len(parts) == 4 and parts[0] == "api" and parts[1] == "team" and parts[3] == "status":
+                self.send_remote_member_status(parts[2])
+                return
+            if len(parts) == 4 and parts[0] == "api" and parts[1] == "team" and parts[3] == "projects":
+                self.send_remote_projects(parts[2])
+                return
+            if len(parts) == 5 and parts[0] == "api" and parts[1] == "team" and parts[3] == "projects":
+                self.send_remote_project(parts[2], parts[4])
+                return
+        if path.startswith("/api/projects/"):
+            parts = [unquote(part) for part in path.split("/") if part]
+            if len(parts) == 3 and parts[0] == "api" and parts[1] == "projects":
+                payload = read_projects()
+                project = find_project(payload, parts[2])
+                if project is None:
+                    self.send_error(404, "Project not found")
+                    return
+                self.send_json({"project": project})
+                return
+            if len(parts) == 6 and parts[0] == "api" and parts[1] == "projects" and parts[3] == "packages" and parts[5] == "preview":
+                self.send_package_preview(parts[2], parts[4])
+                return
+            self.send_error(404)
             return
         if path.startswith("/api/annotations/"):
             item_id = unquote(path.removeprefix("/api/annotations/"))
@@ -301,9 +697,16 @@ class Handler(BaseHTTPRequestHandler):
             target = safe_join(ROOT, path)
             self.send_file(target)
             return
-        if path.startswith("/data/"):
-            target = safe_join(dataset_dir(), path.removeprefix("/data/"))
+        if path.startswith("/data/images/"):
+            target = safe_join(image_dir(), path.removeprefix("/data/images/"))
             self.send_file(target)
+            return
+        if path.startswith("/data/labels/"):
+            target = safe_join(label_dir(), path.removeprefix("/data/labels/"))
+            self.send_file(target)
+            return
+        if path == "/data/classes.json":
+            self.send_file(class_file())
             return
 
         self.send_error(404)
@@ -311,14 +714,21 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
+
         if path == "/api/dataset":
             try:
-                length = int(self.headers.get("content-length", "0"))
-                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                payload = self.read_json_body()
                 raw_path = str(payload.get("path", "")).strip()
-                if not raw_path:
-                    raise ValueError("path is required")
-                summary = set_dataset(resolve_dataset_path(raw_path))
+                raw_images = str(payload.get("imagesPath", "")).strip()
+                raw_labels = str(payload.get("labelsPath", "")).strip()
+                if raw_images or raw_labels:
+                    if not raw_images or not raw_labels:
+                        raise ValueError("imagesPath 和 labelsPath 需要同时填写")
+                    summary = set_dataset_paths(resolve_dataset_path(raw_images), resolve_dataset_path(raw_labels))
+                else:
+                    if not raw_path:
+                        raise ValueError("path is required")
+                    summary = set_dataset(resolve_dataset_path(raw_path))
             except Exception as exc:
                 self.send_error(400, str(exc))
                 return
@@ -327,8 +737,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/classes":
             try:
-                length = int(self.headers.get("content-length", "0"))
-                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                payload = self.read_json_body()
                 classes = payload.get("classes", {})
                 if not isinstance(classes, dict):
                     raise ValueError("classes must be an object")
@@ -338,6 +747,90 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_json({"ok": True, "classes": read_classes()})
             return
+
+        if path == "/api/projects":
+            try:
+                payload = self.read_json_body()
+                name = str(payload.get("name", "")).strip()
+                description = str(payload.get("description", "")).strip()
+                if not name:
+                    raise ValueError("项目名称不能为空")
+                projects_payload = read_projects()
+                now = now_iso()
+                project = {
+                    "id": make_id("proj"),
+                    "name": name,
+                    "description": description,
+                    "createdAt": now,
+                    "updatedAt": now,
+                    "packages": [],
+                }
+                projects_payload["projects"].append(project)
+                write_projects(projects_payload)
+            except Exception as exc:
+                self.send_error(400, str(exc))
+                return
+            self.send_json({"ok": True, "project": project}, status=201)
+            return
+
+        if path == "/api/team":
+            try:
+                payload = self.read_json_body()
+                name = str(payload.get("name", "")).strip()
+                ip = str(payload.get("ip", "")).strip()
+                username = str(payload.get("username", "")).strip()
+                password = str(payload.get("password", "")).strip()
+                home_url = str(payload.get("homeUrl", "")).strip()
+                remark = str(payload.get("remark", "")).strip()
+                if not name:
+                    raise ValueError("成员名称不能为空")
+                team_payload = read_team()
+                now = now_iso()
+                member = {
+                    "id": make_id("member"),
+                    "name": name,
+                    "ip": ip,
+                    "username": username,
+                    "password": password,
+                    "homeUrl": home_url,
+                    "remark": remark,
+                    "createdAt": now,
+                    "updatedAt": now,
+                }
+                team_payload["members"].append(member)
+                write_team(team_payload)
+            except Exception as exc:
+                self.send_error(400, str(exc))
+                return
+            self.send_json({"ok": True, "member": member}, status=201)
+            return
+
+        if path.startswith("/api/team/"):
+            parts = [unquote(part) for part in path.split("/") if part]
+            if len(parts) == 3 and parts[0] == "api" and parts[1] == "team":
+                self.update_member(parts[2])
+                return
+            if len(parts) == 4 and parts[0] == "api" and parts[1] == "team" and parts[3] == "open":
+                self.open_member(parts[2])
+                return
+            if len(parts) == 7 and parts[0] == "api" and parts[1] == "team" and parts[3] == "projects" and parts[5] == "packages":
+                self.update_remote_package_status(parts[2], parts[4], parts[6])
+                return
+
+        if path.startswith("/api/projects/"):
+            parts = [unquote(part) for part in path.split("/") if part]
+            if len(parts) == 4 and parts[0] == "api" and parts[1] == "projects" and parts[3] == "packages":
+                self.create_package(parts[2])
+                return
+            if len(parts) == 5 and parts[0] == "api" and parts[1] == "projects" and parts[3] == "packages":
+                self.update_package(parts[2], parts[4])
+                return
+            if len(parts) == 6 and parts[0] == "api" and parts[1] == "projects" and parts[3] == "packages" and parts[5] == "activate":
+                self.activate_package(parts[2], parts[4])
+                return
+            if len(parts) == 6 and parts[0] == "api" and parts[1] == "projects" and parts[3] == "packages" and parts[5] == "status":
+                self.update_package_status(parts[2], parts[4])
+                return
 
         if not path.startswith("/api/annotations/"):
             self.send_error(404)
@@ -349,18 +842,326 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            length = int(self.headers.get("content-length", "0"))
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            payload = self.read_json_body()
             annotations = payload.get("annotations", [])
             if not isinstance(annotations, list):
                 raise ValueError("annotations must be a list")
             label_dir().mkdir(parents=True, exist_ok=True)
-            label_path(item_id).write_text(serialize_label(annotations), encoding="utf-8")
+            normalized_annotations = []
+            for entry in annotations:
+                if not isinstance(entry, dict):
+                    continue
+                points = entry.get("points", [])
+                if not isinstance(points, list):
+                    continue
+                normalized_points = []
+                for point in points:
+                    if not isinstance(point, (list, tuple)) or len(point) != 2:
+                        continue
+                    normalized_points.append([float(point[0]), float(point[1])])
+                if len(normalized_points) < 3:
+                    continue
+                format_name = str(entry.get("format", "seg")).strip().lower()
+                normalized_annotations.append({
+                    "cls": str(entry.get("cls", "0")).strip() or "0",
+                    "format": format_name if format_name in {"seg", "hbb", "obb"} else "seg",
+                    "points": normalized_points,
+                })
+            label_dir().mkdir(parents=True, exist_ok=True)
+            label_path(item_id).write_text(serialize_label(normalized_annotations), encoding="utf-8")
         except Exception as exc:
             self.send_error(400, str(exc))
             return
 
         self.send_json({"ok": True, "label": f"data/labels/{item_id}.txt"})
+
+    def read_json_body(self) -> dict:
+        length = int(self.headers.get("content-length", "0"))
+        raw = self.rfile.read(length).decode("utf-8") if length else "{}"
+        payload = json.loads(raw or "{}")
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object")
+        return payload
+
+    def create_package(self, project_id: str) -> None:
+        try:
+            payload = self.read_json_body()
+            name = str(payload.get("name", "")).strip()
+            images_path = str(payload.get("imagesPath", "")).strip()
+            labels_path = str(payload.get("labelsPath", "")).strip()
+            package_format = str(payload.get("format", "seg")).strip().lower()
+            remark = str(payload.get("remark", "")).strip()
+            if not name:
+                raise ValueError("数据包名称不能为空")
+            if not images_path:
+                raise ValueError("图片路径不能为空")
+            if package_format not in ANNOTATION_FORMATS:
+                raise ValueError("标注格式不支持")
+
+            images = resolve_dataset_path(images_path)
+            labels = resolve_dataset_path(labels_path) if labels_path else images.parent / "labels"
+            summary = validate_dataset_paths(images, labels) if labels_path else summarize_unlabeled_dataset(images, labels)
+
+            projects_payload = read_projects()
+            project = find_project(projects_payload, project_id)
+            if project is None:
+                self.send_error(404, "Project not found")
+                return
+
+            now = now_iso()
+            package = {
+                "id": make_id("pkg"),
+                "name": name,
+                "imagesPath": str(images),
+                "labelsPath": str(labels),
+                "format": package_format,
+                "remark": remark,
+                "status": "pending",
+                "imageCount": summary["imageCount"],
+                "labelCount": summary["labelCount"],
+                "createdAt": now,
+                "updatedAt": now,
+            }
+            project["packages"].append(package)
+            project["updatedAt"] = now
+            write_projects(projects_payload)
+        except Exception as exc:
+            self.send_error(400, str(exc))
+            return
+
+        self.send_json({"ok": True, "package": package, "project": project}, status=201)
+
+    def update_member(self, member_id: str) -> None:
+        try:
+            payload = self.read_json_body()
+            team_payload = read_team()
+            member = find_member(team_payload, member_id)
+            if member is None:
+                self.send_error(404, "Member not found")
+                return
+
+            name = str(payload.get("name", member["name"])).strip()
+            ip = str(payload.get("ip", member.get("ip", ""))).strip()
+            username = str(payload.get("username", member.get("username", ""))).strip()
+            password = str(payload.get("password", member.get("password", ""))).strip()
+            home_url = str(payload.get("homeUrl", member.get("homeUrl", ""))).strip()
+            remark = str(payload.get("remark", member.get("remark", ""))).strip()
+            if not name:
+                raise ValueError("成员名称不能为空")
+
+            member["name"] = name
+            member["ip"] = ip
+            member["username"] = username
+            member["password"] = password
+            member["homeUrl"] = home_url
+            member["remark"] = remark
+            member["updatedAt"] = now_iso()
+            write_team(team_payload)
+        except Exception as exc:
+            self.send_error(400, str(exc))
+            return
+
+        self.send_json({"ok": True, "member": member})
+
+    def delete_member(self, member_id: str) -> None:
+        team_payload = read_team()
+        member = find_member(team_payload, member_id)
+        if member is None:
+            self.send_error(404, "Member not found")
+            return
+
+        team_payload["members"] = [item for item in team_payload["members"] if item["id"] != member_id]
+        write_team(team_payload)
+        self.send_json({"ok": True, "deletedMemberId": member_id})
+
+    def open_member(self, member_id: str) -> None:
+        team_payload = read_team()
+        member = find_member(team_payload, member_id)
+        if member is None:
+            self.send_error(404, "Member not found")
+            return
+
+        target = str(member.get("homeUrl", "")).strip()
+        if not target:
+            self.send_error(400, "该成员还没有配置主页地址")
+            return
+
+        self.send_json({"ok": True, "member": member, "target": target})
+
+    def send_remote_projects(self, member_id: str) -> None:
+        team_payload = read_team()
+        member = find_member(team_payload, member_id)
+        if member is None:
+            self.send_error(404, "Member not found")
+            return
+        try:
+            payload = remote_request(member, "/api/projects")
+        except Exception as exc:
+            self.send_error(400, str(exc))
+            return
+        self.send_json({"ok": True, "member": member, "projects": payload.get("projects", [])})
+
+    def send_remote_member_status(self, member_id: str) -> None:
+        team_payload = read_team()
+        member = find_member(team_payload, member_id)
+        if member is None:
+            self.send_error(404, "Member not found")
+            return
+        try:
+            remote_request(member, "/api/projects")
+            self.send_json({"ok": True, "memberId": member_id, "online": True})
+        except Exception as exc:
+            self.send_json({"ok": True, "memberId": member_id, "online": False, "detail": str(exc)})
+
+    def send_remote_project(self, member_id: str, project_id: str) -> None:
+        team_payload = read_team()
+        member = find_member(team_payload, member_id)
+        if member is None:
+            self.send_error(404, "Member not found")
+            return
+        try:
+            payload = remote_request(member, f"/api/projects/{quote(project_id)}")
+        except Exception as exc:
+            self.send_error(400, str(exc))
+            return
+        self.send_json({"ok": True, "member": member, "project": payload.get("project")})
+
+    def update_remote_package_status(self, member_id: str, project_id: str, package_id: str) -> None:
+        team_payload = read_team()
+        member = find_member(team_payload, member_id)
+        if member is None:
+            self.send_error(404, "Member not found")
+            return
+        try:
+            payload = self.read_json_body()
+            status = str(payload.get("status", "")).strip()
+            if status not in PACKAGE_STATUSES:
+                raise ValueError("无效的状态")
+            response = remote_request(
+                member,
+                f"/api/projects/{quote(project_id)}/packages/{quote(package_id)}/status",
+                method="POST",
+                payload={"status": status},
+            )
+        except Exception as exc:
+            self.send_error(400, str(exc))
+            return
+        self.send_json({"ok": True, "member": member, "statusLabel": response.get("statusLabel"), "package": response.get("package")})
+
+    def activate_package(self, project_id: str, package_id: str) -> None:
+        projects_payload = read_projects()
+        project = find_project(projects_payload, project_id)
+        if project is None:
+            self.send_error(404, "Project not found")
+            return
+        package = find_package(project, package_id)
+        if package is None:
+            self.send_error(404, "Package not found")
+            return
+
+        try:
+            images = resolve_dataset_path(package["imagesPath"])
+            raw_labels = str(package.get("labelsPath", "")).strip()
+            labels = resolve_dataset_path(raw_labels) if raw_labels else images.parent / "labels"
+            summary = set_dataset_paths(images, labels) if raw_labels else set_dataset_paths_unchecked(images, labels)
+        except Exception as exc:
+            self.send_error(400, str(exc))
+            return
+
+        self.send_json({"ok": True, "dataset": summary, "project": project, "package": package})
+
+    def update_package(self, project_id: str, package_id: str) -> None:
+        try:
+            payload = self.read_json_body()
+            projects_payload = read_projects()
+            project = find_project(projects_payload, project_id)
+            if project is None:
+                self.send_error(404, "Project not found")
+                return
+            package = find_package(project, package_id)
+            if package is None:
+                self.send_error(404, "Package not found")
+                return
+
+            name = str(payload.get("name", package["name"])).strip()
+            remark = str(payload.get("remark", package.get("remark", ""))).strip()
+            if not name:
+                raise ValueError("数据包名称不能为空")
+
+            now = now_iso()
+            package["name"] = name
+            package["remark"] = remark
+            package["updatedAt"] = now
+            project["updatedAt"] = now
+            write_projects(projects_payload)
+        except Exception as exc:
+            self.send_error(400, str(exc))
+            return
+
+        self.send_json({"ok": True, "package": package, "project": project})
+
+    def update_package_status(self, project_id: str, package_id: str) -> None:
+        try:
+            payload = self.read_json_body()
+            status = str(payload.get("status", "")).strip()
+            if status not in PACKAGE_STATUSES:
+                raise ValueError("无效的状态")
+
+            projects_payload = read_projects()
+            project = find_project(projects_payload, project_id)
+            if project is None:
+                self.send_error(404, "Project not found")
+                return
+            package = find_package(project, package_id)
+            if package is None:
+                self.send_error(404, "Package not found")
+                return
+
+            now = now_iso()
+            package["status"] = status
+            package["updatedAt"] = now
+            project["updatedAt"] = now
+            write_projects(projects_payload)
+        except Exception as exc:
+            self.send_error(400, str(exc))
+            return
+
+        self.send_json({"ok": True, "package": package, "project": project, "statusLabel": PACKAGE_STATUSES[status]})
+
+    def delete_package(self, project_id: str, package_id: str) -> None:
+        projects_payload = read_projects()
+        project = find_project(projects_payload, project_id)
+        if project is None:
+            self.send_error(404, "Project not found")
+            return
+
+        package = find_package(project, package_id)
+        if package is None:
+            self.send_error(404, "Package not found")
+            return
+
+        project["packages"] = [item for item in project["packages"] if item["id"] != package_id]
+        project["updatedAt"] = now_iso()
+        write_projects(projects_payload)
+        self.send_json({"ok": True, "project": project, "deletedPackageId": package_id})
+
+    def send_package_preview(self, project_id: str, package_id: str, include_body: bool = True) -> None:
+        projects_payload = read_projects()
+        project = find_project(projects_payload, project_id)
+        if project is None:
+            self.send_error(404, "Project not found")
+            return
+
+        package = find_package(project, package_id)
+        if package is None:
+            self.send_error(404, "Package not found")
+            return
+
+        preview = first_image_in_dir(resolve_dataset_path(package["imagesPath"]))
+        if preview is None:
+            self.send_error(404, "Preview image not found")
+            return
+        self.send_file(preview, include_body=include_body)
 
     def list_images(self) -> list[dict]:
         items = []
@@ -383,13 +1184,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404, "Image not found")
             return
         label = label_path(item_id)
+        annotations = parse_label(label)
         self.send_json(
             {
                 "id": item_id,
                 "filename": image.name,
                 "imageUrl": f"/data/images/{image.name}",
                 "labelUrl": f"/data/labels/{label.name}",
-                "annotations": parse_label(label),
+                "annotations": annotations,
             }
         )
 
@@ -433,12 +1235,30 @@ class Handler(BaseHTTPRequestHandler):
         print(f"{self.address_string()} - {fmt % args}")
 
 
+def ensure_default_files() -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    legacy_map = {
+        ROOT / "projects_config.json": PROJECTS_FILE,
+        ROOT / "team_config.json": TEAM_FILE,
+        ROOT / ".dataset.json": DATASET_FILE,
+    }
+    for old_path, new_path in legacy_map.items():
+        if not new_path.exists() and old_path.exists():
+            shutil.move(str(old_path), str(new_path))
+    if not PROJECTS_FILE.exists():
+        write_projects(default_projects_payload())
+    if not TEAM_FILE.exists():
+        write_team(default_team_payload())
+
+
 def main() -> None:
+    ensure_default_files()
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
     host = sys.argv[2] if len(sys.argv) > 2 else "0.0.0.0"
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"标注平台已启动: http://{host}:{port}")
-    print("数据目录:", dataset_dir())
+    print("图片目录:", image_dir())
+    print("标签目录:", label_dir())
     server.serve_forever()
 
 
