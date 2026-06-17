@@ -236,6 +236,7 @@ async function activatePackageFromQuery() {
   const packageId = params.get("packageId");
   const packageName = params.get("packageName");
   const packageFormat = String(params.get("format") || "seg").toLowerCase();
+  const activated = params.get("activated");
 
   if (packageName) {
     document.title = `${packageName} - 标注器`;
@@ -250,7 +251,7 @@ async function activatePackageFromQuery() {
     el.brandLink.href = `/#/project/${encodeURIComponent(projectId)}`;
   }
 
-  if (!projectId || !packageId) return;
+  if (!projectId || !packageId || activated === "1") return;
 
   const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/packages/${encodeURIComponent(packageId)}/activate`, {
     method: "POST",
@@ -343,6 +344,7 @@ async function selectImage(index) {
   updateNavigationUI();
   el.emptyText.style.display = "none";
   canvas.style.cursor = "default";
+  imgEl.src = img.imageUrl;
 
   try {
     const res = await fetch(`/api/annotations/${encodeURIComponent(img.id)}`);
@@ -355,8 +357,8 @@ async function selectImage(index) {
   } catch (error) {
     console.error(error);
   }
-
-  imgEl.src = img.imageUrl;
+  if (currentItem()?.id !== img.id) return;
+  renderAll();
 }
 
 function normalizeAnnotation(item) {

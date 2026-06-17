@@ -1,5 +1,5 @@
 {
   "images": "data/images",
   "labels": "data/labels",
-  "allowUnlabeled": true
+  "allowUnlabeled": false
 }
