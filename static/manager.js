@@ -1192,6 +1192,14 @@ el.grid.addEventListener("click", (event) => {
     return;
   }
 
+  const deleteProjectAction = event.target.closest("[data-delete-project]");
+  if (deleteProjectAction) {
+    event.stopPropagation();
+    closeAllMenus();
+    deleteProject(deleteProjectAction.dataset.deleteProject).catch((error) => showStatus(error.message, "error"));
+    return;
+  }
+
   const projectCard = event.target.closest("[data-open-project]");
   if (projectCard) {
     setProjectsView(projectCard.dataset.openProject);
@@ -1246,12 +1254,6 @@ el.grid.addEventListener("click", (event) => {
     closeAllMenus();
     deletePackage(deleteAction.dataset.deletePackage).catch((error) => showStatus(error.message, "error"));
     return;
-  }
-
-  const deleteProjectAction = event.target.closest("[data-delete-project]");
-  if (deleteProjectAction) {
-    closeAllMenus();
-    deleteProject(deleteProjectAction.dataset.deleteProject).catch((error) => showStatus(error.message, "error"));
   }
 });
 

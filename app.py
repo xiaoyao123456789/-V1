@@ -97,6 +97,7 @@ def default_dataset_payload() -> dict:
     return {
         "images": portable_path_string(DEFAULT_DATASET_DIR / "images"),
         "labels": portable_path_string(DEFAULT_DATASET_DIR / "labels"),
+        "allowUnlabeled": False,
     }
 
 
@@ -177,6 +178,7 @@ def current_dataset_config() -> dict:
             "mode": "split",
             "images": str(images),
             "labels": str(labels),
+            "allowUnlabeled": bool(raw.get("allowUnlabeled", False)),
         }
 
     root = resolve_dataset_path(str(raw.get("path", DEFAULT_DATASET_DIR)))
@@ -234,6 +236,26 @@ def dataset_summary(images: Path, labels: Path, mode: str, root_path: Path | Non
     }
     if mode == "root" and root_path is not None:
         summary["path"] = str(root_path)
+    return summary
+
+
+def summarize_dataset_paths(images: Path, labels: Path, mode: str = "split", root_path: Path | None = None) -> dict:
+    if not images.exists() or not images.is_dir():
+        raise ValueError("图片目录不存在")
+
+    image_map = {p.stem: p for p in images.iterdir() if p.suffix.lower() in IMAGE_EXTS and p.is_file()}
+    if not image_map:
+        raise ValueError("图片目录里没有可用图片")
+
+    labels.mkdir(parents=True, exist_ok=True)
+    label_map = {p.stem: p for p in labels.iterdir() if p.suffix.lower() == ".txt" and p.is_file()}
+
+    summary = dataset_summary(images, labels, mode=mode, root_path=root_path)
+    summary["imageCount"] = len(image_map)
+    summary["labelCount"] = len(label_map)
+    summary["missingLabelCount"] = len(set(image_map) - set(label_map))
+    summary["extraLabelCount"] = len(set(label_map) - set(image_map))
+    summary["hasAnyLabel"] = bool(label_map)
     return summary
 
 
@@ -299,68 +321,48 @@ def move_current_to_delete(item_id: str) -> dict:
 
 
 def validate_dataset_paths(images: Path, labels: Path, mode: str = "split", root_path: Path | None = None) -> dict:
-    if not images.exists() or not images.is_dir():
-        raise ValueError("图片目录不存在")
-    if not labels.exists() or not labels.is_dir():
-        raise ValueError("标签目录不存在")
-
-    image_map = {p.stem: p for p in images.iterdir() if p.suffix.lower() in IMAGE_EXTS and p.is_file()}
-    label_map = {p.stem: p for p in labels.iterdir() if p.suffix.lower() == ".txt" and p.is_file()}
-    if not image_map:
-        raise ValueError("图片目录里没有可用图片")
-
-    missing_labels = sorted(set(image_map) - set(label_map))
-    extra_labels = sorted(set(label_map) - set(image_map))
-    if missing_labels or extra_labels:
-        detail = []
-        if missing_labels:
-            detail.append(f"缺少标签 {len(missing_labels)} 个，例如 {missing_labels[0]}")
-        if extra_labels:
-            detail.append(f"多余标签 {len(extra_labels)} 个，例如 {extra_labels[0]}")
-        raise ValueError("图片和标签文件名没有一一对应：" + "；".join(detail))
-
-    summary = dataset_summary(images, labels, mode=mode, root_path=root_path)
-    summary["imageCount"] = len(image_map)
-    summary["labelCount"] = len(label_map)
-    return summary
+    return summarize_dataset_paths(images, labels, mode=mode, root_path=root_path)
 
 
 def summarize_unlabeled_dataset(images: Path, labels: Path, mode: str = "split", root_path: Path | None = None) -> dict:
-    if not images.exists() or not images.is_dir():
-        raise ValueError("图片目录不存在")
-    image_map = {p.stem: p for p in images.iterdir() if p.suffix.lower() in IMAGE_EXTS and p.is_file()}
-    if not image_map:
-        raise ValueError("图片目录里没有可用图片")
-
-    labels.mkdir(parents=True, exist_ok=True)
-    label_map = {p.stem: p for p in labels.iterdir() if p.suffix.lower() == ".txt" and p.is_file()}
-    summary = dataset_summary(images, labels, mode=mode, root_path=root_path)
-    summary["imageCount"] = len(image_map)
-    summary["labelCount"] = len(label_map)
-    return summary
+    return summarize_dataset_paths(images, labels, mode=mode, root_path=root_path)
 
 
 def validate_dataset(path: Path) -> dict:
     if not path.exists() or not path.is_dir():
         raise ValueError("数据集目录不存在")
-    return validate_dataset_paths(path / "images", path / "labels", mode="root", root_path=path)
+    return summarize_dataset_paths(path / "images", path / "labels", mode="root", root_path=path)
 
 
 def set_dataset(path: Path) -> dict:
     summary = validate_dataset(path)
-    write_json_file(DATASET_FILE, {"path": portable_path_string(path)})
+    write_json_file(DATASET_FILE, {"path": portable_path_string(path), "allowUnlabeled": False})
     return summary
 
 
 def set_dataset_paths(images: Path, labels: Path) -> dict:
     summary = validate_dataset_paths(images, labels)
-    write_json_file(DATASET_FILE, {"images": portable_path_string(images), "labels": portable_path_string(labels)})
+    write_json_file(
+        DATASET_FILE,
+        {
+            "images": portable_path_string(images),
+            "labels": portable_path_string(labels),
+            "allowUnlabeled": False,
+        },
+    )
     return summary
 
 
 def set_dataset_paths_unchecked(images: Path, labels: Path) -> dict:
     summary = summarize_unlabeled_dataset(images, labels)
-    write_json_file(DATASET_FILE, {"images": portable_path_string(images), "labels": portable_path_string(labels)})
+    write_json_file(
+        DATASET_FILE,
+        {
+            "images": portable_path_string(images),
+            "labels": portable_path_string(labels),
+            "allowUnlabeled": True,
+        },
+    )
     return summary
 
 
@@ -368,7 +370,7 @@ def validate_current_dataset() -> dict:
     config = current_dataset_config()
     if config["mode"] == "root":
         return validate_dataset(Path(config["path"]))
-    return validate_dataset_paths(image_dir(), label_dir(), mode="split")
+    return summarize_dataset_paths(image_dir(), label_dir(), mode="split")
 
 
 def parse_label(path: Path) -> list[dict]:
@@ -741,10 +743,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_file(STATIC_DIR / "annotator.html")
             return
         if path == "/api/images":
-            self.send_json({"images": self.list_images(), "dataset": validate_current_dataset()})
+            images = self.list_images()
+            try:
+                dataset = validate_current_dataset()
+                self.send_json({"images": images, "dataset": dataset})
+            except Exception as exc:
+                self.send_json({"images": images, "dataset": None, "datasetError": str(exc)})
             return
         if path == "/api/dataset":
-            self.send_json({"dataset": validate_current_dataset()})
+            try:
+                self.send_json({"dataset": validate_current_dataset()})
+            except Exception as exc:
+                self.send_json({"dataset": None, "datasetError": str(exc)}, status=200)
             return
         if path == "/api/classes":
             self.send_json({"classes": read_legacy_classes()})
@@ -824,9 +834,11 @@ class Handler(BaseHTTPRequestHandler):
                 raw_images = str(payload.get("imagesPath", "")).strip()
                 raw_labels = str(payload.get("labelsPath", "")).strip()
                 if raw_images or raw_labels:
-                    if not raw_images or not raw_labels:
-                        raise ValueError("imagesPath 和 labelsPath 需要同时填写")
-                    summary = set_dataset_paths(resolve_dataset_path(raw_images), resolve_dataset_path(raw_labels))
+                    if not raw_images:
+                        raise ValueError("imagesPath 不能为空")
+                    images = resolve_dataset_path(raw_images)
+                    labels = resolve_dataset_path(raw_labels) if raw_labels else images.parent / "labels"
+                    summary = set_dataset_paths(images, labels) if raw_labels else set_dataset_paths_unchecked(images, labels)
                 else:
                     if not raw_path:
                         raise ValueError("path is required")

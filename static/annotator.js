@@ -256,8 +256,15 @@ async function activatePackageFromQuery() {
     method: "POST",
   });
   if (!response.ok) {
-    throw new Error("激活数据包失败");
+    const message = await response.text();
+    throw new Error(message || "激活数据包失败");
   }
+}
+
+function updateEmptyState(message) {
+  el.emptyText.textContent = message || "暂无可标注图片，请先激活数据包或导入图片目录";
+  el.emptyText.style.display = "block";
+  el.imageWrapper.hidden = true;
 }
 
 function updateNavigationUI() {
@@ -1259,7 +1266,8 @@ async function fetchImagesList() {
   try {
     const response = await fetch("/api/images");
     if (response.ok) {
-      imagesData = (await response.json()).images;
+      const payload = await response.json();
+      imagesData = Array.isArray(payload.images) ? payload.images : [];
       if (imagesData.length > 0 && currentIndex === -1) {
         const savedId = localStorage.getItem("voc_last_image_id");
         let startIdx = 0;
@@ -1269,11 +1277,15 @@ async function fetchImagesList() {
         }
         selectImage(startIdx);
       } else {
+        if (!imagesData.length) {
+          updateEmptyState(payload.datasetError || "暂无可标注图片，请先激活数据包或导入图片目录");
+        }
         updateNavigationUI();
       }
     }
   } catch (error) {
     console.error(error);
+    updateEmptyState("图片列表加载失败，请检查程序目录和数据路径");
   }
 }
 
@@ -1410,6 +1422,7 @@ window.onload = async () => {
     await activatePackageFromQuery();
   } catch (error) {
     console.error(error);
+    updateEmptyState(error.message || "激活数据包失败");
   }
 
   await fetchClasses();
