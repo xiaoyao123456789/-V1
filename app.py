@@ -1020,7 +1020,7 @@ class Handler(BaseHTTPRequestHandler):
                 "id": make_id("pkg"),
                 "name": name,
                 "imagesPath": portable_path_string(images),
-                "labelsPath": portable_path_string(labels),
+                "labelsPath": portable_path_string(labels) if labels_path else "",
                 "format": package_format,
                 "remark": remark,
                 "status": "pending",
@@ -1195,7 +1195,10 @@ class Handler(BaseHTTPRequestHandler):
             images = resolve_dataset_path(package["imagesPath"])
             raw_labels = str(package.get("labelsPath", "")).strip()
             labels = resolve_dataset_path(raw_labels) if raw_labels else images.parent / "labels"
-            summary = set_dataset_paths(images, labels) if raw_labels else set_dataset_paths_unchecked(images, labels)
+            image_count = int(package.get("imageCount", 0) or 0)
+            label_count = int(package.get("labelCount", 0) or 0)
+            should_validate_labels = bool(raw_labels) and image_count > 0 and label_count == image_count
+            summary = set_dataset_paths(images, labels) if should_validate_labels else set_dataset_paths_unchecked(images, labels)
         except Exception as exc:
             self.send_error(400, str(exc))
             return
@@ -1352,6 +1355,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
+        short, default_explain = self.responses.get(code, ("Unknown Error", ""))
+        body = str(message or short)
+        data = body.encode("utf-8", errors="replace")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
 
     def send_json(self, payload: dict, status: int = 200) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
