@@ -1,15 +1,15 @@
 {
   "members": [
     {
-      "id": "member_07fa292d67",
+      "id": "member_8902c94cd9",
       "name": "范海彦",
       "ip": "192.168.1.33",
-      "username": "hua",
-      "password": "hua123",
-      "homeUrl": "",
+      "username": "",
+      "password": "",
+      "homeUrl": "http://192.168.1.33:8000",
       "remark": "",
-      "createdAt": "2026-06-16T17:10:46",
-      "updatedAt": "2026-06-16T17:40:21"
+      "createdAt": "2026-06-17T14:15:19",
+      "updatedAt": "2026-06-17T14:15:45"
     }
   ]
 }

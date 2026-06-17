@@ -5,13 +5,27 @@
       "name": "坑槽检测",
       "description": "",
       "createdAt": "2026-06-16T14:30:44",
-      "updatedAt": "2026-06-17T11:09:55",
+      "updatedAt": "2026-06-17T16:44:54",
+      "classes": {
+        "0": {
+          "name": "blockpatch",
+          "color": "#ff4d4f"
+        },
+        "1": {
+          "name": "kuaizhunaglief",
+          "color": "#1890ff"
+        },
+        "2": {
+          "name": "junlie",
+          "color": "#52c41a"
+        }
+      },
       "packages": [
         {
           "id": "pkg_2d32d81a12",
           "name": "20260616更新包",
-          "imagesPath": "/home/nvidia/Downloads/Yy/code/v1/data/images",
-          "labelsPath": "/home/nvidia/Downloads/Yy/code/v1/data/labels",
+          "imagesPath": "data/images",
+          "labelsPath": "data/labels",
           "format": "seg",
           "remark": "",
           "status": "pending",
@@ -23,8 +37,8 @@
         {
           "id": "pkg_a5286b75e6",
           "name": "20260616更新包-obb",
-          "imagesPath": "/home/nvidia/Downloads/Yy/code/v1/data/images",
-          "labelsPath": "/home/nvidia/Downloads/Yy/code/v1/data/labels",
+          "imagesPath": "data/images",
+          "labelsPath": "data/labels",
           "format": "obb",
           "remark": "",
           "status": "pending",
@@ -41,6 +55,20 @@
       "description": "",
       "createdAt": "2026-06-16T16:20:49",
       "updatedAt": "2026-06-16T16:20:49",
+      "classes": {
+        "0": {
+          "name": "blockpatch",
+          "color": "#ff4d4f"
+        },
+        "1": {
+          "name": "kuaizhunaglief",
+          "color": "#1890ff"
+        },
+        "2": {
+          "name": "junlie",
+          "color": "#52c41a"
+        }
+      },
       "packages": []
     }
   ]

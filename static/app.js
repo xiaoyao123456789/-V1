@@ -14,8 +14,6 @@ const state = {
   undoStack: [],
 };
 
-const colors = ["#06a77d", "#e4572e", "#4f7cac", "#9d5cbd", "#d19c1d", "#2e8b57", "#c44569"];
-
 const el = {
   list: document.querySelector("#imageList"),
   counter: document.querySelector("#counter"),
@@ -85,13 +83,11 @@ function pointAttrs(point) {
 }
 
 function colorFor(cls) {
-  const key = Number.parseInt(cls, 10);
-  const index = Number.isFinite(key) ? Math.abs(key) % colors.length : 0;
-  return colors[index];
+  return state.classMap[String(cls)]?.color || "#06a77d";
 }
 
 function classLabel(cls) {
-  return state.classMap[String(cls)] || `class_${cls}`;
+  return state.classMap[String(cls)]?.name || `class_${cls}`;
 }
 
 function markDirty(value = true) {
@@ -140,7 +136,12 @@ function undo() {
 }
 
 async function loadImages() {
-  const [imagesResponse, classesResponse] = await Promise.all([fetch("/api/images"), fetch("/api/classes")]);
+  const params = pageParams();
+  const projectId = params.get("projectId");
+  const classesUrl = projectId
+    ? `/api/projects/${encodeURIComponent(projectId)}/classes`
+    : "/api/classes";
+  const [imagesResponse, classesResponse] = await Promise.all([fetch("/api/images"), fetch(classesUrl)]);
   const data = await imagesResponse.json();
   const classData = await classesResponse.json();
   state.classMap = classData.classes || {};
@@ -493,12 +494,13 @@ function serializeCurrent() {
 function renderClassConfig() {
   el.classList.innerHTML = "";
   const entries = sortedClasses();
-  for (const [cls, name] of entries) {
+  for (const [cls, meta] of entries) {
     const row = document.createElement("div");
     row.className = "class-row";
     row.innerHTML = `
       <input class="class-id" value="${escapeHtml(cls)}" aria-label="类别编号" />
-      <input class="class-name" value="${escapeHtml(name)}" aria-label="类别名称" />
+      <input class="class-name" value="${escapeHtml(meta.name || cls)}" aria-label="类别名称" />
+      <input class="class-color" value="${escapeHtml(meta.color || "#06a77d")}" aria-label="类别颜色" type="color" />
       <button class="remove-class" type="button" title="删除类别">x</button>
     `;
     row.querySelector(".remove-class").addEventListener("click", () => {
@@ -530,10 +532,10 @@ function sortedClasses() {
 function renderClassSelect() {
   const previous = el.classSelect.value || "0";
   el.classSelect.innerHTML = "";
-  for (const [cls, name] of sortedClasses()) {
+  for (const [cls, meta] of sortedClasses()) {
     const option = document.createElement("option");
     option.value = cls;
-    option.textContent = `${cls} - ${name}`;
+    option.textContent = `${cls} - ${meta.name || cls}`;
     el.classSelect.appendChild(option);
   }
   if (!state.classMap[previous]) {
@@ -550,7 +552,8 @@ function syncClassMapFromForm() {
   el.classList.querySelectorAll(".class-row").forEach((row) => {
     const cls = row.querySelector(".class-id").value.trim();
     const name = row.querySelector(".class-name").value.trim();
-    if (cls) next[cls] = name || cls;
+    const color = row.querySelector(".class-color").value;
+    if (cls) next[cls] = { name: name || cls, color: color || "#06a77d" };
   });
   state.classMap = next;
 }
@@ -558,7 +561,7 @@ function syncClassMapFromForm() {
 function ensureClassOption(cls) {
   const value = String(cls || "0");
   if (state.classMap[value]) return;
-  state.classMap[value] = `class_${value}`;
+  state.classMap[value] = { name: `class_${value}`, color: "#06a77d" };
   renderClassConfig();
   renderClassSelect();
 }
@@ -566,7 +569,12 @@ function ensureClassOption(cls) {
 async function saveClasses() {
   syncClassMapFromForm();
   setStatus("保存类别中");
-  const response = await fetch("/api/classes", {
+  const params = pageParams();
+  const projectId = params.get("projectId");
+  const url = projectId
+    ? `/api/projects/${encodeURIComponent(projectId)}/classes`
+    : "/api/classes";
+  const response = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ classes: state.classMap }),
@@ -587,7 +595,7 @@ function addClass() {
   syncClassMapFromForm();
   let id = 0;
   while (state.classMap[String(id)]) id += 1;
-  state.classMap[String(id)] = `class_${id}`;
+  state.classMap[String(id)] = { name: `class_${id}`, color: "#06a77d" };
   renderClassConfig();
   renderClassSelect();
 }

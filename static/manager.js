@@ -6,6 +6,7 @@ const PACKAGE_STATUS_META = {
 };
 
 const WEEK_LABELS = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"];
+const CLASS_COLOR_PALETTE = ["#ff4d4f", "#1890ff", "#52c41a", "#faad14", "#722ed1", "#eb2f96", "#13c2c2", "#fa8c16"];
 
 const state = {
   projects: [],
@@ -14,10 +15,12 @@ const state = {
   currentView: "home",
   search: "",
   editingMemberId: null,
+  editingClassId: null,
   remoteMember: null,
   remoteProjects: [],
   remoteCurrentProjectId: null,
   memberStatus: {},
+  editingClasses: {},
 };
 
 const el = {
@@ -32,6 +35,8 @@ const el = {
   grid: document.querySelector("#grid"),
   teamSection: document.querySelector("#teamSection"),
   teamList: document.querySelector("#teamList"),
+  classSection: document.querySelector("#classSection"),
+  classList: document.querySelector("#classList"),
   emptyState: document.querySelector("#emptyState"),
   emptyText: document.querySelector("#emptyText"),
   statusBanner: document.querySelector("#statusBanner"),
@@ -45,11 +50,21 @@ const el = {
   projectDialog: document.querySelector("#projectDialog"),
   packageDialog: document.querySelector("#packageDialog"),
   memberDialog: document.querySelector("#memberDialog"),
+  classDialog: document.querySelector("#classDialog"),
   projectForm: document.querySelector("#projectForm"),
   packageForm: document.querySelector("#packageForm"),
   memberForm: document.querySelector("#memberForm"),
+  classForm: document.querySelector("#classForm"),
   projectName: document.querySelector("#projectName"),
   projectDescription: document.querySelector("#projectDescription"),
+  addClassBtn: document.querySelector("#addClassBtn"),
+  saveClassBtn: document.querySelector("#saveClassBtn"),
+  classSkeletonBtn: document.querySelector("#classSkeletonBtn"),
+  classModelBtn: document.querySelector("#classModelBtn"),
+  classDialogTitle: document.querySelector("#classDialogTitle"),
+  classIdInput: document.querySelector("#classIdInput"),
+  classNameInput: document.querySelector("#classNameInput"),
+  classColorInput: document.querySelector("#classColorInput"),
   packageName: document.querySelector("#packageName"),
   packageImagesPath: document.querySelector("#packageImagesPath"),
   packageLabelsPath: document.querySelector("#packageLabelsPath"),
@@ -119,6 +134,32 @@ function packageStatusMeta(status) {
 
 function currentProject() {
   return state.projects.find((project) => project.id === state.currentProjectId) || null;
+}
+
+function hasProject(projectId) {
+  return state.projects.some((project) => project.id === projectId);
+}
+
+function classEntries(classes = {}) {
+  return Object.entries(classes).sort(([a], [b]) => {
+    const aNum = Number.parseInt(a, 10);
+    const bNum = Number.parseInt(b, 10);
+    const aIsNum = String(aNum) === a;
+    const bIsNum = String(bNum) === b;
+    if (aIsNum && bIsNum) return aNum - bNum;
+    if (aIsNum) return -1;
+    if (bIsNum) return 1;
+    return a.localeCompare(b, "zh-CN");
+  });
+}
+
+function currentProjectClasses() {
+  return currentProject()?.classes || {};
+}
+
+function syncEditingClasses() {
+  const project = currentProject();
+  state.editingClasses = project ? JSON.parse(JSON.stringify(project.classes || {})) : {};
 }
 
 function currentMode() {
@@ -199,6 +240,13 @@ function closeDialog(dialog) {
   dialog.close();
 }
 
+function fitPackageNameInput(input) {
+  if (!input) return;
+  const text = input.value?.trim() || input.placeholder || "";
+  const next = Math.max(8, Math.min(text.length + 1, 28));
+  input.style.width = `${next}ch`;
+}
+
 function openProjectDialog() {
   el.projectForm.reset();
   el.projectDialog.showModal();
@@ -264,6 +312,7 @@ function setHomeView() {
 function setProjectsView(projectId = null) {
   state.currentView = "projects";
   state.currentProjectId = projectId;
+  syncEditingClasses();
 }
 
 function setTeamView() {
@@ -381,8 +430,29 @@ function filteredMembers() {
 function renderEmpty(text) {
   el.grid.innerHTML = "";
   el.teamList.innerHTML = "";
+  if (el.classList) el.classList.innerHTML = "";
   el.emptyText.textContent = text;
   el.emptyState.hidden = false;
+}
+
+function renderClassSection(project) {
+  if (!project) {
+    el.classSection.hidden = true;
+    el.classList.innerHTML = "";
+    return;
+  }
+
+  const classes = classEntries(state.editingClasses);
+  el.classSection.hidden = false;
+  el.classList.innerHTML = classes.map(([key, value]) => `
+    <article class="class-pill" style="--pill-color:${escapeAttr(value.color || "#888888")}" data-edit-class="${escapeAttr(key)}">
+      <span class="class-pill-name">${escapeHtml(value.name || key)}</span>
+      <span class="class-pill-actions">
+        <button class="class-pill-icon" type="button" title="编辑" data-edit-class="${escapeAttr(key)}">✎</button>
+        <button class="class-pill-icon" type="button" title="删除" data-delete-class="${escapeAttr(key)}">🗑</button>
+      </span>
+    </article>
+  `).join("");
 }
 
 function dashboardProjects() {
@@ -490,9 +560,13 @@ function renderProjects() {
   el.emptyState.hidden = true;
   el.grid.innerHTML = projects.map((project) => `
     <article class="project-tile" tabindex="0" role="button" data-open-project="${project.id}">
+      <button class="project-menu-trigger" type="button" aria-label="更多操作" data-project-menu-trigger="${project.id}">⋮</button>
       <div class="project-icon">${iconForProject(project.name)}</div>
       <h3>${escapeHtml(project.name)}</h3>
       <p>${escapeHtml(project.id)}</p>
+      <div class="project-menu-panel" hidden data-project-menu-panel="${project.id}">
+        <button type="button" class="danger" data-delete-project="${project.id}">删除项目</button>
+      </div>
     </article>
   `).join("");
 }
@@ -559,6 +633,9 @@ function renderPackages(project) {
     </section>
   `;
   closeAllMenus();
+  document.querySelectorAll(".package-name-input").forEach((input) => {
+    fitPackageNameInput(input);
+  });
 }
 
 function renderRemotePackages(project) {
@@ -637,6 +714,9 @@ function closeAllMenus() {
   document.querySelectorAll("[data-menu-panel]").forEach((panel) => {
     panel.hidden = true;
   });
+  document.querySelectorAll("[data-project-menu-panel]").forEach((panel) => {
+    panel.hidden = true;
+  });
 }
 
 function render() {
@@ -651,6 +731,7 @@ function render() {
   el.grid.hidden = mode === "team" || mode === "home";
   el.teamSection.hidden = mode !== "team";
   el.teamList.hidden = mode !== "team";
+  el.classSection.hidden = mode !== "packages";
 
   if (mode === "home") {
     renderDashboard();
@@ -681,9 +762,11 @@ function render() {
 
   const project = currentProject();
   if (!project) {
+    renderClassSection(null);
     renderProjects();
     return;
   }
+  renderClassSection(project);
   renderPackages(project);
 }
 
@@ -701,7 +784,9 @@ async function loadProjects() {
   state.projects = Array.isArray(payload.projects) ? payload.projects : [];
   if (state.currentProjectId && !currentProject()) {
     state.currentProjectId = null;
+    state.currentView = "projects";
   }
+  if (currentProject()) syncEditingClasses();
 }
 
 async function loadTeam() {
@@ -732,6 +817,10 @@ async function refreshAll({ silentTeamError = true } = {}) {
     state.memberStatus = {};
     if (!silentTeamError) throw error;
   }
+  if (state.currentProjectId && !hasProject(state.currentProjectId)) {
+    setProjectsView();
+    showStatus("项目不存在或已被删除", "error");
+  }
   render();
 }
 
@@ -747,6 +836,77 @@ async function createProject(event) {
   });
   closeDialog(el.projectDialog);
   showStatus(`项目“${payload.project.name}”已创建`);
+  await refreshAll();
+}
+
+function nextClassId() {
+  let id = 0;
+  while (state.editingClasses[String(id)]) id += 1;
+  return String(id);
+}
+
+function addClassRow() {
+  const key = nextClassId();
+  const color = CLASS_COLOR_PALETTE[Object.keys(state.editingClasses).length % CLASS_COLOR_PALETTE.length];
+  state.editingClasses[key] = { name: `class_${key}`, color };
+  openClassDialog(key, true);
+}
+
+function deleteClassRow(classId) {
+  const remaining = Object.keys(state.editingClasses).length;
+  if (remaining <= 1) {
+    showStatus("至少保留一个类别", "error");
+    return;
+  }
+  delete state.editingClasses[classId];
+  renderClassSection(currentProject());
+}
+
+function openClassDialog(classId, isNew = false) {
+  const item = state.editingClasses[classId];
+  if (!item) return;
+  state.editingClassId = classId;
+  el.classDialogTitle.textContent = isNew ? "新增类别" : "编辑类别";
+  el.classIdInput.value = classId;
+  el.classNameInput.value = item.name || classId;
+  el.classColorInput.value = item.color || "#ff4d4f";
+  el.classDialog.showModal();
+  el.classNameInput.focus();
+}
+
+function closeClassDialog() {
+  state.editingClassId = null;
+  if (el.classDialog.open) closeDialog(el.classDialog);
+}
+
+async function saveProjectClasses() {
+  const project = currentProject();
+  if (!project) return;
+  const payload = await request(`/api/projects/${encodeURIComponent(project.id)}/classes`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ classes: state.editingClasses }),
+  });
+  const target = state.projects.find((item) => item.id === project.id);
+  if (target) {
+    target.classes = payload.classes || {};
+  }
+  syncEditingClasses();
+  render();
+  showStatus("类别标签已保存");
+}
+
+async function deleteProject(projectId) {
+  const project = state.projects.find((item) => item.id === projectId);
+  if (!project) return;
+  if (!window.confirm(`确定删除项目“${project.name}”吗？项目下的数据包记录也会一起删除。`)) return;
+  await request(`/api/projects/${encodeURIComponent(projectId)}`, {
+    method: "DELETE",
+  });
+  if (state.currentProjectId === projectId) {
+    setProjectsView();
+  }
+  showStatus("项目已删除");
   await refreshAll();
 }
 
@@ -958,6 +1118,34 @@ el.packageForm.addEventListener("submit", (event) => {
   createPackage(event).catch((error) => showStatus(error.message, "error"));
 });
 
+el.addClassBtn.addEventListener("click", () => {
+  addClassRow();
+});
+
+el.saveClassBtn.addEventListener("click", () => {
+  saveProjectClasses().catch((error) => showStatus(error.message, "error"));
+});
+
+el.classSkeletonBtn.addEventListener("click", () => {
+  showStatus("骨架标签暂未接入，先用 Add label 即可", "error");
+});
+
+el.classModelBtn.addEventListener("click", () => {
+  showStatus("模型导入暂未接入，先手动创建标签", "error");
+});
+
+el.classForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const classId = state.editingClassId;
+  if (!classId || !state.editingClasses[classId]) return;
+  state.editingClasses[classId] = {
+    name: el.classNameInput.value.trim() || classId,
+    color: el.classColorInput.value,
+  };
+  closeClassDialog();
+  renderClassSection(currentProject());
+});
+
 el.memberForm.addEventListener("submit", (event) => {
   createMember(event).catch((error) => showStatus(error.message, "error"));
 });
@@ -982,6 +1170,7 @@ el.dashboardView.addEventListener("click", (event) => {
   const projectCard = event.target.closest("[data-open-project]");
   if (projectCard) {
     setProjectsView(projectCard.dataset.openProject);
+    syncEditingClasses();
     render();
     return;
   }
@@ -993,9 +1182,20 @@ el.dashboardView.addEventListener("click", (event) => {
 });
 
 el.grid.addEventListener("click", (event) => {
+  const projectMenuTrigger = event.target.closest("[data-project-menu-trigger]");
+  if (projectMenuTrigger) {
+    event.stopPropagation();
+    const targetPanel = document.querySelector(`[data-project-menu-panel="${projectMenuTrigger.dataset.projectMenuTrigger}"]`);
+    const willOpen = targetPanel.hidden;
+    closeAllMenus();
+    targetPanel.hidden = !willOpen;
+    return;
+  }
+
   const projectCard = event.target.closest("[data-open-project]");
   if (projectCard) {
     setProjectsView(projectCard.dataset.openProject);
+    syncEditingClasses();
     render();
     return;
   }
@@ -1045,6 +1245,13 @@ el.grid.addEventListener("click", (event) => {
   if (deleteAction) {
     closeAllMenus();
     deletePackage(deleteAction.dataset.deletePackage).catch((error) => showStatus(error.message, "error"));
+    return;
+  }
+
+  const deleteProjectAction = event.target.closest("[data-delete-project]");
+  if (deleteProjectAction) {
+    closeAllMenus();
+    deleteProject(deleteProjectAction.dataset.deleteProject).catch((error) => showStatus(error.message, "error"));
   }
 });
 
@@ -1088,6 +1295,27 @@ el.grid.addEventListener("change", (event) => {
     .catch((error) => showStatus(error.message, "error"));
 });
 
+el.grid.addEventListener("input", (event) => {
+  const input = event.target.closest(".package-name-input");
+  if (!input) return;
+  fitPackageNameInput(input);
+});
+
+el.classList.addEventListener("input", (event) => {
+  return;
+});
+
+el.classList.addEventListener("click", (event) => {
+  const editAction = event.target.closest("[data-edit-class]");
+  if (editAction) {
+    openClassDialog(editAction.dataset.editClass);
+    return;
+  }
+  const deleteAction = event.target.closest("[data-delete-class]");
+  if (!deleteAction) return;
+  deleteClassRow(deleteAction.dataset.deleteClass);
+});
+
 document.addEventListener("click", (event) => {
   if (!event.target.closest(".menu-wrap")) {
     closeAllMenus();
@@ -1112,6 +1340,10 @@ window.setInterval(updateClock, 1000);
 
 window.addEventListener("hashchange", () => {
   restoreStateFromHash();
+  if (state.currentProjectId && !hasProject(state.currentProjectId)) {
+    setProjectsView();
+    showStatus("项目不存在或已被删除", "error");
+  }
   render();
 });
 

@@ -104,6 +104,22 @@
 
       <section id="statusBanner" class="status-banner" hidden></section>
 
+      <section id="classSection" class="class-section" hidden>
+        <div class="class-section-head">
+          <div class="class-tabs" role="tablist" aria-label="Class tools">
+            <button class="class-tab active" type="button">Raw</button>
+            <button class="class-tab" type="button">Constructor</button>
+          </div>
+          <div class="class-section-actions">
+            <button id="addClassBtn" class="class-tool-btn" type="button">Add label <span>+</span></button>
+            <button id="classSkeletonBtn" class="class-tool-btn" type="button" disabled>Setup skeleton <span>+</span></button>
+            <button id="classModelBtn" class="class-tool-btn" type="button" disabled>From model <span>+</span></button>
+            <button id="saveClassBtn" class="class-save-btn" type="button">Save changes</button>
+          </div>
+        </div>
+        <div id="classList" class="class-list"></div>
+      </section>
+
       <section id="emptyState" class="empty-state" hidden>
         <h3>还没有内容</h3>
         <p id="emptyText">先创建一个项目，后续再往里面添加数据包。</p>
@@ -217,6 +233,34 @@
       <div class="dialog-actions">
         <button class="ghost-btn" type="button" data-close="memberDialog">取消</button>
         <button class="primary-btn" type="submit">保存成员</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="classDialog" class="form-dialog">
+    <form id="classForm" method="dialog" class="dialog-card class-dialog-card">
+      <div class="dialog-head">
+        <div>
+          <p class="eyebrow">Edit Label</p>
+          <h3 id="classDialogTitle">编辑类别</h3>
+        </div>
+        <button class="icon-btn" type="button" data-close="classDialog">×</button>
+      </div>
+      <label class="field">
+        <span>类别 ID</span>
+        <input id="classIdInput" name="classId" type="text" readonly>
+      </label>
+      <label class="field">
+        <span>类别名称</span>
+        <input id="classNameInput" name="className" type="text" placeholder="例如：Crack" required>
+      </label>
+      <label class="field">
+        <span>颜色</span>
+        <input id="classColorInput" name="classColor" type="color" value="#ff4d4f">
+      </label>
+      <div class="dialog-actions">
+        <button class="ghost-btn" type="button" data-close="classDialog">取消</button>
+        <button class="primary-btn" type="submit">保存标签</button>
       </div>
     </form>
   </dialog>

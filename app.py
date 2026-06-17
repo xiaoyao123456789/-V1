@@ -5,13 +5,14 @@ import json
 import mimetypes
 import os
 import posixpath
+import re
 import shutil
 import socket
 import sys
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urljoin, urlparse
 from urllib.request import Request, urlopen
@@ -27,6 +28,9 @@ DATASET_FILE = CONFIG_DIR / "dataset.json"
 PROJECTS_FILE = CONFIG_DIR / "projects.json"
 TEAM_FILE = CONFIG_DIR / "team.json"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+LEGACY_CLASSES_FILE = DEFAULT_DATASET_DIR / "classes.json"
+CLASS_COLOR_PALETTE = ["#ff4d4f", "#1890ff", "#52c41a", "#faad14", "#722ed1", "#eb2f96", "#13c2c2", "#fa8c16"]
+HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
 def read_json_file(path: Path, fallback):
@@ -43,17 +47,128 @@ def write_json_file(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def is_windows_absolute_path(raw_path: str) -> bool:
+    candidate = PureWindowsPath(str(raw_path).strip())
+    return bool(candidate.drive and candidate.root)
+
+
+def remap_missing_path(raw_path: str) -> Path | None:
+    parts = [part for part in str(raw_path).replace("\\", "/").split("/") if part and part != "."]
+    for start in range(len(parts)):
+        candidate = (ROOT / Path(*parts[start:])).resolve()
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def resolve_dataset_path(raw_path: str) -> Path:
-    path = Path(raw_path).expanduser()
-    if not path.is_absolute():
-        path = (ROOT / path).resolve()
-    return path
+    raw = str(raw_path).strip()
+    if not raw:
+        return ROOT
+
+    if is_windows_absolute_path(raw):
+        remapped = remap_missing_path(raw)
+        return remapped if remapped is not None else Path(raw)
+
+    path = Path(raw).expanduser()
+    if path.is_absolute():
+        resolved = path.resolve()
+        if resolved.exists():
+            return resolved
+        remapped = remap_missing_path(raw)
+        return remapped if remapped is not None else resolved
+
+    resolved = (ROOT / path).resolve()
+    if resolved.exists():
+        return resolved
+    remapped = remap_missing_path(raw)
+    return remapped if remapped is not None else resolved
+
+
+def portable_path_string(path: Path) -> str:
+    resolved = path.resolve()
+    try:
+        return str(resolved.relative_to(ROOT))
+    except ValueError:
+        return str(resolved)
+
+
+def default_dataset_payload() -> dict:
+    return {
+        "images": portable_path_string(DEFAULT_DATASET_DIR / "images"),
+        "labels": portable_path_string(DEFAULT_DATASET_DIR / "labels"),
+    }
+
+
+def ensure_json_file(path: Path, fallback: dict) -> dict:
+    payload = read_json_file(path, None)
+    if not isinstance(payload, dict):
+        write_json_file(path, fallback)
+        return fallback
+    return payload
+
+
+def class_sort_key(value: str) -> tuple[int, int | str]:
+    text = str(value).strip()
+    if text.isdigit():
+        return (0, int(text))
+    return (1, text)
+
+
+def normalize_class_color(raw_color: str | None, index: int) -> str:
+    color = str(raw_color or "").strip()
+    if HEX_COLOR_RE.match(color):
+        return color.lower()
+    return CLASS_COLOR_PALETTE[index % len(CLASS_COLOR_PALETTE)]
+
+
+def default_project_classes() -> dict[str, dict[str, str]]:
+    return {
+        "0": {"name": "class_0", "color": CLASS_COLOR_PALETTE[0]},
+        "1": {"name": "class_1", "color": CLASS_COLOR_PALETTE[1]},
+        "2": {"name": "class_2", "color": CLASS_COLOR_PALETTE[2]},
+    }
+
+
+def read_legacy_classes() -> dict[str, dict[str, str]]:
+    raw = read_json_file(LEGACY_CLASSES_FILE, {})
+    if not isinstance(raw, dict) or not raw:
+        return default_project_classes()
+    normalized = {}
+    for index, key in enumerate(sorted(raw.keys(), key=class_sort_key)):
+        cls = str(key).strip()
+        if not cls:
+            continue
+        normalized[cls] = {
+            "name": str(raw.get(key, cls)).strip() or cls,
+            "color": normalize_class_color(None, index),
+        }
+    return normalized or default_project_classes()
+
+
+def normalize_classes(raw_classes) -> dict[str, dict[str, str]]:
+    source = raw_classes if isinstance(raw_classes, dict) and raw_classes else read_legacy_classes()
+    normalized = {}
+    keys = sorted(source.keys(), key=class_sort_key)
+    for index, key in enumerate(keys):
+        cls = str(key).strip()
+        if not cls:
+            continue
+        value = source.get(key)
+        if isinstance(value, dict):
+            name = str(value.get("name", cls)).strip() or cls
+            color = normalize_class_color(value.get("color"), index)
+        else:
+            name = str(value if value is not None else cls).strip() or cls
+            color = normalize_class_color(None, index)
+        normalized[cls] = {"name": name, "color": color}
+    return normalized or default_project_classes()
 
 
 def current_dataset_config() -> dict:
     raw = read_json_file(DATASET_FILE, {})
     if not isinstance(raw, dict):
-        raw = {}
+        raw = default_dataset_payload()
 
     if "images" in raw and "labels" in raw:
         images = resolve_dataset_path(str(raw.get("images", "")))
@@ -233,19 +348,19 @@ def validate_dataset(path: Path) -> dict:
 
 def set_dataset(path: Path) -> dict:
     summary = validate_dataset(path)
-    write_json_file(DATASET_FILE, {"path": str(path)})
+    write_json_file(DATASET_FILE, {"path": portable_path_string(path)})
     return summary
 
 
 def set_dataset_paths(images: Path, labels: Path) -> dict:
     summary = validate_dataset_paths(images, labels)
-    write_json_file(DATASET_FILE, {"images": str(images), "labels": str(labels)})
+    write_json_file(DATASET_FILE, {"images": portable_path_string(images), "labels": portable_path_string(labels)})
     return summary
 
 
 def set_dataset_paths_unchecked(images: Path, labels: Path) -> dict:
     summary = summarize_unlabeled_dataset(images, labels)
-    write_json_file(DATASET_FILE, {"images": str(images), "labels": str(labels)})
+    write_json_file(DATASET_FILE, {"images": portable_path_string(images), "labels": portable_path_string(labels)})
     return summary
 
 
@@ -254,30 +369,6 @@ def validate_current_dataset() -> dict:
     if config["mode"] == "root":
         return validate_dataset(Path(config["path"]))
     return validate_dataset_paths(image_dir(), label_dir(), mode="split")
-
-
-def read_classes() -> dict[str, str]:
-    path = class_file()
-    if not path.exists():
-        return {"0": "class_0", "1": "class_1", "2": "class_2"}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {"0": "class_0", "1": "class_1", "2": "class_2"}
-    if not isinstance(data, dict):
-        return {"0": "class_0", "1": "class_1", "2": "class_2"}
-    return {str(key): str(value) for key, value in data.items()}
-
-
-def write_classes(classes: dict) -> None:
-    class_file().parent.mkdir(parents=True, exist_ok=True)
-    normalized = {}
-    for key, value in classes.items():
-        cls = str(key).strip()
-        name = str(value).strip()
-        if cls:
-            normalized[cls] = name or cls
-    class_file().write_text(json.dumps(normalized, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def parse_label(path: Path) -> list[dict]:
@@ -413,8 +504,8 @@ def normalize_package(raw: dict) -> dict:
     return {
         "id": str(raw.get("id") or make_id("pkg")),
         "name": str(raw.get("name", "")).strip(),
-        "imagesPath": str(images) if images else "",
-        "labelsPath": str(labels) if labels else "",
+        "imagesPath": portable_path_string(images) if images else "",
+        "labelsPath": portable_path_string(labels) if labels else "",
         "format": str(raw.get("format", "seg")).strip().lower() if str(raw.get("format", "seg")).strip().lower() in ANNOTATION_FORMATS else "seg",
         "remark": str(raw.get("remark", "")).strip(),
         "status": str(raw.get("status", "pending")) if str(raw.get("status", "pending")) in PACKAGE_STATUSES else "pending",
@@ -423,6 +514,10 @@ def normalize_package(raw: dict) -> dict:
         "createdAt": str(raw.get("createdAt") or now_iso()),
         "updatedAt": str(raw.get("updatedAt") or raw.get("createdAt") or now_iso()),
     }
+
+
+def normalize_project_classes(raw: dict) -> dict[str, dict[str, str]]:
+    return normalize_classes(raw.get("classes", {}))
 
 
 def first_image_in_dir(images_dir: Path) -> Path | None:
@@ -442,6 +537,7 @@ def normalize_project(raw: dict) -> dict:
         "description": str(raw.get("description", "")).strip(),
         "createdAt": str(raw.get("createdAt") or now_iso()),
         "updatedAt": str(raw.get("updatedAt") or raw.get("createdAt") or now_iso()),
+        "classes": normalize_project_classes(raw),
         "packages": [normalize_package(item) for item in packages if isinstance(item, dict)],
     }
 
@@ -619,6 +715,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/projects/"):
             parts = [unquote(part) for part in path.split("/") if part]
+            if len(parts) == 3 and parts[0] == "api" and parts[1] == "projects":
+                self.delete_project(parts[2])
+                return
             if len(parts) == 5 and parts[0] == "api" and parts[1] == "projects" and parts[3] == "packages":
                 self.delete_package(parts[2], parts[4])
                 return
@@ -648,7 +747,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"dataset": validate_current_dataset()})
             return
         if path == "/api/classes":
-            self.send_json({"classes": read_classes()})
+            self.send_json({"classes": read_legacy_classes()})
             return
         if path == "/api/projects":
             self.send_json(read_projects())
@@ -680,6 +779,9 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_error(404, "Project not found")
                     return
                 self.send_json({"project": project})
+                return
+            if len(parts) == 4 and parts[0] == "api" and parts[1] == "projects" and parts[3] == "classes":
+                self.send_project_classes(parts[2])
                 return
             if len(parts) == 6 and parts[0] == "api" and parts[1] == "projects" and parts[3] == "packages" and parts[5] == "preview":
                 self.send_package_preview(parts[2], parts[4])
@@ -741,11 +843,12 @@ class Handler(BaseHTTPRequestHandler):
                 classes = payload.get("classes", {})
                 if not isinstance(classes, dict):
                     raise ValueError("classes must be an object")
-                write_classes(classes)
+                classes = normalize_classes(classes)
+                write_json_file(LEGACY_CLASSES_FILE, {key: value["name"] for key, value in classes.items()})
             except Exception as exc:
                 self.send_error(400, str(exc))
                 return
-            self.send_json({"ok": True, "classes": read_classes()})
+            self.send_json({"ok": True, "classes": read_legacy_classes()})
             return
 
         if path == "/api/projects":
@@ -763,6 +866,7 @@ class Handler(BaseHTTPRequestHandler):
                     "description": description,
                     "createdAt": now,
                     "updatedAt": now,
+                    "classes": default_project_classes(),
                     "packages": [],
                 }
                 projects_payload["projects"].append(project)
@@ -819,6 +923,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/projects/"):
             parts = [unquote(part) for part in path.split("/") if part]
+            if len(parts) == 4 and parts[0] == "api" and parts[1] == "projects" and parts[3] == "classes":
+                self.update_project_classes(parts[2])
+                return
             if len(parts) == 4 and parts[0] == "api" and parts[1] == "projects" and parts[3] == "packages":
                 self.create_package(parts[2])
                 return
@@ -912,8 +1019,8 @@ class Handler(BaseHTTPRequestHandler):
             package = {
                 "id": make_id("pkg"),
                 "name": name,
-                "imagesPath": str(images),
-                "labelsPath": str(labels),
+                "imagesPath": portable_path_string(images),
+                "labelsPath": portable_path_string(labels),
                 "format": package_format,
                 "remark": remark,
                 "status": "pending",
@@ -1025,6 +1132,31 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(400, str(exc))
             return
         self.send_json({"ok": True, "member": member, "project": payload.get("project")})
+
+    def send_project_classes(self, project_id: str) -> None:
+        projects_payload = read_projects()
+        project = find_project(projects_payload, project_id)
+        if project is None:
+            self.send_error(404, "Project not found")
+            return
+        self.send_json({"ok": True, "projectId": project_id, "classes": project.get("classes", default_project_classes())})
+
+    def update_project_classes(self, project_id: str) -> None:
+        try:
+            payload = self.read_json_body()
+            projects_payload = read_projects()
+            project = find_project(projects_payload, project_id)
+            if project is None:
+                self.send_error(404, "Project not found")
+                return
+            classes = normalize_classes(payload.get("classes", {}))
+            project["classes"] = classes
+            project["updatedAt"] = now_iso()
+            write_projects(projects_payload)
+        except Exception as exc:
+            self.send_error(400, str(exc))
+            return
+        self.send_json({"ok": True, "projectId": project_id, "classes": project["classes"], "project": project})
 
     def update_remote_package_status(self, member_id: str, project_id: str, package_id: str) -> None:
         team_payload = read_team()
@@ -1145,6 +1277,17 @@ class Handler(BaseHTTPRequestHandler):
         write_projects(projects_payload)
         self.send_json({"ok": True, "project": project, "deletedPackageId": package_id})
 
+    def delete_project(self, project_id: str) -> None:
+        projects_payload = read_projects()
+        project = find_project(projects_payload, project_id)
+        if project is None:
+            self.send_error(404, "Project not found")
+            return
+
+        projects_payload["projects"] = [item for item in projects_payload["projects"] if item["id"] != project_id]
+        write_projects(projects_payload)
+        self.send_json({"ok": True, "deletedProjectId": project_id})
+
     def send_package_preview(self, project_id: str, package_id: str, include_body: bool = True) -> None:
         projects_payload = read_projects()
         project = find_project(projects_payload, project_id)
@@ -1245,10 +1388,9 @@ def ensure_default_files() -> None:
     for old_path, new_path in legacy_map.items():
         if not new_path.exists() and old_path.exists():
             shutil.move(str(old_path), str(new_path))
-    if not PROJECTS_FILE.exists():
-        write_projects(default_projects_payload())
-    if not TEAM_FILE.exists():
-        write_team(default_team_payload())
+    ensure_json_file(PROJECTS_FILE, default_projects_payload())
+    ensure_json_file(TEAM_FILE, default_team_payload())
+    ensure_json_file(DATASET_FILE, default_dataset_payload())
 
 
 def main() -> None:

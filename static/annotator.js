@@ -16,7 +16,6 @@ let classesData = {};
 const canvas = document.getElementById("draw-canvas");
 const ctx = canvas.getContext("2d");
 const imgEl = document.getElementById("main-image");
-const colors = ["#ff4d4f", "#1890ff", "#52c41a", "#faad14", "#722ed1", "#eb2f96", "#13c2c2", "#fa8c16"];
 const OBB_ROTATE_HANDLE_OFFSET = 28;
 const OBB_ROTATE_HANDLE_RADIUS = 7;
 
@@ -101,11 +100,11 @@ function currentItem() {
 }
 
 function colorFor(cls) {
-  return colors[Number.parseInt(cls, 10) % colors.length || 0];
+  return classesData[String(cls)]?.color || "#1890ff";
 }
 
 function classNameFor(cls) {
-  return classesData[cls] || cls;
+  return classesData[String(cls)]?.name || cls;
 }
 
 function cloneAnnotations(items = state.annotations) {
@@ -754,7 +753,7 @@ function showClassPopup(clientX, clientY, annoIdx) {
         return `
           <button type="button" class="class-popup-item ${active ? "active" : ""}" data-popup-class="${escapeHtml(key)}" style="--item-color:${color};--item-color-soft:${color}22">
             <span class="class-popup-swatch"></span>
-            <span class="class-popup-name">${escapeHtml(value)}</span>
+            <span class="class-popup-name">${escapeHtml(value.name || key)}</span>
             <span class="class-popup-key">${escapeHtml(key)}</span>
           </button>
         `;
@@ -1238,12 +1237,17 @@ async function saveAnnotations(isAuto = false) {
 
 async function fetchClasses() {
   try {
-    const res = await fetch("/api/classes");
+    const params = pageParams();
+    const projectId = params.get("projectId");
+    const url = projectId
+      ? `/api/projects/${encodeURIComponent(projectId)}/classes`
+      : "/api/classes";
+    const res = await fetch(url);
     if (res.ok) {
       classesData = (await res.json()).classes || {};
       el.classSelect.innerHTML = "";
       Object.entries(classesData).forEach(([key, value]) => {
-        el.classSelect.innerHTML += `<option value="${key}">${key} (${value})</option>`;
+        el.classSelect.innerHTML += `<option value="${key}">${key} (${value.name || key})</option>`;
       });
     }
   } catch (error) {
