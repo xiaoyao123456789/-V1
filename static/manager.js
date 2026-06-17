@@ -1010,7 +1010,6 @@ function openRemoteAnnotator(packageId) {
     projectName: project.name,
     packageName: item.name,
     format: item.format || "seg",
-    activated: "1",
   });
   window.open(`${base}/annotator?${params.toString()}`, "_blank", "noopener");
 }
