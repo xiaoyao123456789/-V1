@@ -30,6 +30,7 @@ const state = {
   },
   mousePos: null,
   selectedAnnoIdx: -1,
+  selectedAnnoIndices: [],
   hoveredAnnoIdx: -1,
   selectedPointIdx: -1,
   dragging: null,
@@ -68,6 +69,8 @@ const el = {
   classSelect: document.getElementById("class-select"),
   classPopup: document.getElementById("class-popup"),
 };
+
+const MULTI_CLASS_PLACEHOLDER = "__multi__";
 
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, (char) => ({
@@ -132,12 +135,65 @@ function undo() {
   const previous = JSON.parse(state.historyStack.pop());
   state.annotations = previous.annotations;
   state.draft = previous.draft;
-  state.selectedAnnoIdx = -1;
-  state.selectedPointIdx = -1;
+  clearSelection();
   state.dragging = null;
   hideClassPopup();
   renderAll();
   triggerAutoSave();
+}
+
+function uniqueValidSelection(indices) {
+  return [...new Set(indices.filter((idx) => Number.isInteger(idx) && idx >= 0 && idx < state.annotations.length))];
+}
+
+function selectionIncludes(idx) {
+  return state.selectedAnnoIndices.includes(idx);
+}
+
+function clearSelection() {
+  state.selectedAnnoIdx = -1;
+  state.selectedAnnoIndices = [];
+  state.selectedPointIdx = -1;
+}
+
+function setSelection(indices, primaryIdx = null) {
+  const next = uniqueValidSelection(indices);
+  state.selectedAnnoIndices = next;
+  state.selectedAnnoIdx = next.length ? (next.includes(primaryIdx) ? primaryIdx : next[next.length - 1]) : -1;
+  if (!next.includes(state.selectedAnnoIdx)) {
+    state.selectedPointIdx = -1;
+  }
+}
+
+function setSingleSelection(idx) {
+  if (idx < 0) {
+    clearSelection();
+    return;
+  }
+  setSelection([idx], idx);
+}
+
+function toggleSelection(idx) {
+  if (selectionIncludes(idx)) {
+    const next = state.selectedAnnoIndices.filter((item) => item !== idx);
+    setSelection(next, next[next.length - 1] ?? null);
+  } else {
+    setSelection([...state.selectedAnnoIndices, idx], idx);
+  }
+}
+
+function selectedAnnotations() {
+  return state.selectedAnnoIndices.map((idx) => state.annotations[idx]).filter(Boolean);
+}
+
+function selectedClassSummary() {
+  const selected = selectedAnnotations();
+  if (!selected.length) return { count: 0, singleClass: null };
+  const classes = [...new Set(selected.map((item) => String(item.cls)))];
+  return {
+    count: selected.length,
+    singleClass: classes.length === 1 ? classes[0] : null,
+  };
 }
 
 function updateModeBadge() {
@@ -216,8 +272,7 @@ function endPan() {
 function setMode(nextMode) {
   state.mode = nextMode;
   if (nextMode === "draw") {
-    state.selectedAnnoIdx = -1;
-    state.selectedPointIdx = -1;
+    clearSelection();
     state.draft.format = state.drawFormat;
     state.draft.points = [];
     canvas.style.cursor = "crosshair";
@@ -237,6 +292,8 @@ async function activatePackageFromQuery() {
   const packageName = params.get("packageName");
   const packageFormat = String(params.get("format") || "seg").toLowerCase();
   const activated = params.get("activated");
+  const returnUrl = params.get("returnUrl");
+  const returnLabel = params.get("returnLabel");
 
   if (packageName) {
     document.title = `${packageName} - 标注器`;
@@ -247,7 +304,10 @@ async function activatePackageFromQuery() {
     state.draft.format = packageFormat;
   }
 
-  if (projectId) {
+  if (returnUrl) {
+    el.brandLink.href = returnUrl;
+    el.brandLink.textContent = returnLabel ? `返回 ${returnLabel}` : "返回团队审核";
+  } else if (projectId) {
     el.brandLink.href = `/#/project/${encodeURIComponent(projectId)}`;
   }
 
@@ -326,6 +386,7 @@ async function selectImage(index) {
   state.draft = { format: state.packageFormat, points: [] };
   state.mousePos = null;
   state.selectedAnnoIdx = -1;
+  state.selectedAnnoIndices = [];
   state.hoveredAnnoIdx = -1;
   state.selectedPointIdx = -1;
   state.dragging = null;
@@ -378,7 +439,9 @@ function renderObjectList() {
 
   state.annotations.forEach((ann, idx) => {
     const li = document.createElement("li");
-    li.className = `object-item ${idx === state.selectedAnnoIdx ? "active" : ""} ${!ann.visible ? "hidden" : ""}`;
+    const isSelected = selectionIncludes(idx);
+    const isPrimary = idx === state.selectedAnnoIdx;
+    li.className = `object-item ${isSelected ? "active" : ""} ${isPrimary ? "primary" : ""} ${!ann.visible ? "hidden" : ""}`;
     li.onmouseenter = () => {
       state.hoveredAnnoIdx = idx;
       renderCanvas();
@@ -387,9 +450,12 @@ function renderObjectList() {
       state.hoveredAnnoIdx = -1;
       renderCanvas();
     };
-    li.onclick = () => {
-      state.selectedAnnoIdx = idx;
-      state.selectedPointIdx = -1;
+    li.onclick = (event) => {
+      if (event.ctrlKey || event.metaKey) {
+        toggleSelection(idx);
+      } else {
+        setSingleSelection(idx);
+      }
       state.mode = "select";
       updateModeBadge();
       hideClassPopup();
@@ -419,8 +485,9 @@ function renderObjectList() {
 function toggleVisibility(event, idx) {
   event.stopPropagation();
   state.annotations[idx].visible = !state.annotations[idx].visible;
-  if (!state.annotations[idx].visible && state.selectedAnnoIdx === idx) {
-    state.selectedAnnoIdx = -1;
+  if (!state.annotations[idx].visible && selectionIncludes(idx)) {
+    const next = state.selectedAnnoIndices.filter((item) => item !== idx);
+    setSelection(next, next[next.length - 1] ?? null);
   }
   renderAll();
 }
@@ -429,7 +496,10 @@ function deleteObject(event, idx) {
   event.stopPropagation();
   saveState();
   state.annotations.splice(idx, 1);
-  if (state.selectedAnnoIdx === idx) state.selectedAnnoIdx = -1;
+  const nextSelection = state.selectedAnnoIndices
+    .filter((item) => item !== idx)
+    .map((item) => (item > idx ? item - 1 : item));
+  setSelection(nextSelection, state.selectedAnnoIdx > idx ? state.selectedAnnoIdx - 1 : state.selectedAnnoIdx);
   if (state.hoveredAnnoIdx === idx) state.hoveredAnnoIdx = -1;
   hideClassPopup();
   renderAll();
@@ -654,6 +724,31 @@ function findAnnotationHit(pt) {
   return -1;
 }
 
+function annotationBounds(annotation) {
+  const xs = annotation.points.map((point) => point[0]);
+  const ys = annotation.points.map((point) => point[1]);
+  return {
+    minX: Math.min(...xs),
+    maxX: Math.max(...xs),
+    minY: Math.min(...ys),
+    maxY: Math.max(...ys),
+  };
+}
+
+function normalizedRect(start, end) {
+  return {
+    minX: Math.min(start[0], end[0]),
+    maxX: Math.max(start[0], end[0]),
+    minY: Math.min(start[1], end[1]),
+    maxY: Math.max(start[1], end[1]),
+  };
+}
+
+function annotationIntersectsRect(annotation, rect) {
+  const bounds = annotationBounds(annotation);
+  return !(bounds.maxX < rect.minX || bounds.minX > rect.maxX || bounds.maxY < rect.minY || bounds.minY > rect.maxY);
+}
+
 function updateDraftShape(pt) {
   if (!state.draft.points.length) return;
   const start = state.draft.points[0];
@@ -714,8 +809,7 @@ function finishBoxDraw() {
     points: state.draft.points.map(([x, y]) => [x, y]),
   };
   state.annotations.push(annotation);
-  state.selectedAnnoIdx = state.annotations.length - 1;
-  state.selectedPointIdx = -1;
+  setSingleSelection(state.annotations.length - 1);
   state.dragging = null;
   state.draft = { format: state.drawFormat, points: [] };
   state.mode = "select";
@@ -732,8 +826,7 @@ function finishSegDraw() {
     visible: true,
     points: state.draft.points.map(([x, y]) => [x, y]),
   });
-  state.selectedAnnoIdx = state.annotations.length - 1;
-  state.selectedPointIdx = -1;
+  setSingleSelection(state.annotations.length - 1);
   state.draft = { format: state.drawFormat, points: [] };
   state.mode = "select";
   updateModeBadge();
@@ -743,8 +836,13 @@ function finishSegDraw() {
 
 function showClassPopup(clientX, clientY, annoIdx) {
   debugLog("showClassPopup", { clientX, clientY, annoIdx, classes: Object.keys(classesData).length });
+  const targetSelection = state.selectedAnnoIndices.length > 1 && selectionIncludes(annoIdx)
+    ? [...state.selectedAnnoIndices]
+    : [annoIdx];
+  setSelection(targetSelection, annoIdx);
   state.popupAnnoIdx = annoIdx;
   const current = state.annotations[annoIdx];
+  const summary = selectedClassSummary();
   const accent = colorFor(current?.cls);
   const entries = Object.entries(classesData);
   el.classPopup.style.setProperty("--popup-accent", accent);
@@ -752,18 +850,25 @@ function showClassPopup(clientX, clientY, annoIdx) {
   el.classPopup.style.setProperty("--popup-accent-strong", `${accent}E6`);
   el.classPopup.innerHTML = `
     <div class="class-popup-title">
-      <span class="class-popup-dot"></span>
-      <span>${escapeHtml(classNameFor(current?.cls || ""))}</span>
+      <div class="class-popup-title-main">
+        <span class="class-popup-dot"></span>
+        <div class="class-popup-heading">
+          <span class="class-popup-label">${summary.count > 1 ? "批量修改类别" : "修改类别"}</span>
+          <span class="class-popup-subtitle">${summary.count > 1 ? `已选中 ${summary.count} 个对象` : escapeHtml(classNameFor(current?.cls || ""))}</span>
+        </div>
+      </div>
+      <span class="class-popup-badge">${summary.count > 1 ? `${summary.count} 项` : "1 项"}</span>
     </div>
     <div class="class-popup-list">
       ${entries.map(([key, value]) => {
         const color = colorFor(key);
-        const active = String(key) === String(current?.cls);
+        const active = String(key) === String(summary.singleClass ?? current?.cls);
         return `
           <button type="button" class="class-popup-item ${active ? "active" : ""}" data-popup-class="${escapeHtml(key)}" style="--item-color:${color};--item-color-soft:${color}22">
             <span class="class-popup-swatch"></span>
             <span class="class-popup-name">${escapeHtml(value.name || key)}</span>
             <span class="class-popup-key">${escapeHtml(key)}</span>
+            <span class="class-popup-check">${active ? "当前" : "切换"}</span>
           </button>
         `;
       }).join("")}
@@ -771,7 +876,7 @@ function showClassPopup(clientX, clientY, annoIdx) {
   `;
   el.classPopup.hidden = false;
   const areaRect = el.canvasArea.getBoundingClientRect();
-  const popupWidth = 232;
+  const popupWidth = 264;
   const popupHeight = Math.min(280, 58 + entries.length * 38);
   const left = Math.min(clientX - areaRect.left + 10, areaRect.width - popupWidth - 10);
   const top = Math.min(clientY - areaRect.top + 10, areaRect.height - popupHeight - 10);
@@ -822,7 +927,7 @@ function onMouseDown(event) {
   const pointHit = findPoint(pt);
   if (pointHit) {
     saveState();
-    state.selectedAnnoIdx = pointHit.annoIdx;
+    setSingleSelection(pointHit.annoIdx);
     state.selectedPointIdx = pointHit.pointIdx;
     state.dragging = {
       type: "point",
@@ -835,9 +940,14 @@ function onMouseDown(event) {
 
   const annoIdx = findAnnotationHit(pt);
   if (annoIdx !== -1) {
+    if (event.ctrlKey || event.metaKey) {
+      toggleSelection(annoIdx);
+      state.selectedPointIdx = -1;
+      renderAll();
+      return;
+    }
     saveState();
-    state.selectedAnnoIdx = annoIdx;
-    state.selectedPointIdx = -1;
+    setSingleSelection(annoIdx);
     state.dragging = {
       type: "annotation",
       annoIdx,
@@ -849,9 +959,14 @@ function onMouseDown(event) {
       beginPan(event.clientX, event.clientY);
       return;
     }
-    state.selectedAnnoIdx = -1;
     state.selectedPointIdx = -1;
-    state.dragging = null;
+    state.dragging = {
+      type: "marquee",
+      start: pt,
+      current: pt,
+      additive: event.ctrlKey || event.metaKey,
+      baseSelection: [...state.selectedAnnoIndices],
+    };
   }
   renderAll();
 }
@@ -898,6 +1013,12 @@ function onMouseMove(event) {
     return;
   }
 
+  if (state.dragging?.type === "marquee") {
+    state.dragging.current = pt;
+    renderCanvas();
+    return;
+  }
+
   if (state.dragging?.type === "rotate-obb") {
     const target = state.annotations[state.dragging.annoIdx];
     if (!target) return;
@@ -937,7 +1058,9 @@ function onCanvasContextMenu(event) {
     hideClassPopup();
     return;
   }
-  state.selectedAnnoIdx = annoIdx;
+  if (!(state.selectedAnnoIndices.length > 1 && selectionIncludes(annoIdx))) {
+    setSingleSelection(annoIdx);
+  }
   state.selectedPointIdx = -1;
   renderAll();
   showClassPopup(event.clientX, event.clientY, annoIdx);
@@ -970,22 +1093,41 @@ function onMouseUp(event) {
     triggerAutoSave();
     return;
   }
+
+  if (state.dragging?.type === "marquee") {
+    const rect = normalizedRect(state.dragging.start, state.dragging.current);
+    const next = state.annotations
+      .map((annotation, idx) => (annotation.visible && annotationIntersectsRect(annotation, rect) ? idx : -1))
+      .filter((idx) => idx !== -1);
+    const selected = state.dragging.additive
+      ? uniqueValidSelection([...state.dragging.baseSelection, ...next])
+      : next;
+    setSelection(selected, selected[selected.length - 1] ?? null);
+    state.dragging = null;
+    renderAll();
+  }
 }
 
 function deleteSelection() {
-  if (state.mode !== "select" || state.selectedAnnoIdx === -1) return;
+  if (state.mode !== "select" || !state.selectedAnnoIndices.length) return;
   saveState();
-  const annotation = state.annotations[state.selectedAnnoIdx];
-  if (state.selectedPointIdx !== -1 && annotation.format === "seg") {
-    annotation.points.splice(state.selectedPointIdx, 1);
-    state.selectedPointIdx = -1;
-    if (annotation.points.length < 3) {
+  if (state.selectedAnnoIndices.length === 1 && state.selectedAnnoIdx !== -1) {
+    const annotation = state.annotations[state.selectedAnnoIdx];
+    if (state.selectedPointIdx !== -1 && annotation.format === "seg") {
+      annotation.points.splice(state.selectedPointIdx, 1);
+      state.selectedPointIdx = -1;
+      if (annotation.points.length < 3) {
+        state.annotations.splice(state.selectedAnnoIdx, 1);
+        clearSelection();
+      }
+    } else {
       state.annotations.splice(state.selectedAnnoIdx, 1);
-      state.selectedAnnoIdx = -1;
+      clearSelection();
     }
   } else {
-    state.annotations.splice(state.selectedAnnoIdx, 1);
-    state.selectedAnnoIdx = -1;
+    const selectedSet = new Set(state.selectedAnnoIndices);
+    state.annotations = state.annotations.filter((_, idx) => !selectedSet.has(idx));
+    clearSelection();
   }
   hideClassPopup();
   renderAll();
@@ -993,16 +1135,33 @@ function deleteSelection() {
 }
 
 function updateClassSelector() {
-  if (state.selectedAnnoIdx !== -1 && state.annotations[state.selectedAnnoIdx]) {
-    el.classSelect.value = state.annotations[state.selectedAnnoIdx].cls;
+  const summary = selectedClassSummary();
+  if (!summary.count) return;
+  const existing = el.classSelect.querySelector(`option[value="${MULTI_CLASS_PLACEHOLDER}"]`);
+  if (summary.singleClass) {
+    if (existing) existing.remove();
+    el.classSelect.value = summary.singleClass;
+    return;
   }
+  if (!existing) {
+    const option = document.createElement("option");
+    option.value = MULTI_CLASS_PLACEHOLDER;
+    option.textContent = "多个类别";
+    el.classSelect.prepend(option);
+  }
+  el.classSelect.value = MULTI_CLASS_PLACEHOLDER;
 }
 
-function applyClassToAnnotation(annoIdx, newCls) {
-  if (annoIdx < 0 || !state.annotations[annoIdx]) return;
+function applyClassToSelection(newCls, annoIndices = state.selectedAnnoIndices) {
+  const targets = uniqueValidSelection(annoIndices);
+  if (!targets.length) return;
   saveState();
-  state.annotations[annoIdx].cls = newCls;
-  if (state.selectedAnnoIdx === annoIdx) {
+  targets.forEach((idx) => {
+    state.annotations[idx].cls = newCls;
+  });
+  const existing = el.classSelect.querySelector(`option[value="${MULTI_CLASS_PLACEHOLDER}"]`);
+  if (existing) existing.remove();
+  if (state.selectedAnnoIdx !== -1) {
     el.classSelect.value = newCls;
   }
   hideClassPopup();
@@ -1010,9 +1169,17 @@ function applyClassToAnnotation(annoIdx, newCls) {
   triggerAutoSave();
 }
 
+function applyClassToAnnotation(annoIdx, newCls) {
+  if (annoIdx < 0 || !state.annotations[annoIdx]) return;
+  const targets = state.selectedAnnoIndices.length > 1 && selectionIncludes(annoIdx)
+    ? state.selectedAnnoIndices
+    : [annoIdx];
+  applyClassToSelection(newCls, targets);
+}
+
 function onClassChange() {
-  if (state.mode === "select" && state.selectedAnnoIdx !== -1) {
-    applyClassToAnnotation(state.selectedAnnoIdx, el.classSelect.value);
+  if (state.mode === "select" && state.selectedAnnoIndices.length && el.classSelect.value !== MULTI_CLASS_PLACEHOLDER) {
+    applyClassToSelection(el.classSelect.value);
   }
 }
 
@@ -1059,9 +1226,25 @@ function drawPoint(pt, fillColor) {
   ctx.stroke();
 }
 
+function renderSelectionMarquee() {
+  if (state.dragging?.type !== "marquee") return;
+  const rect = normalizedRect(state.dragging.start, state.dragging.current);
+  const [x1, y1] = toPixel([rect.minX, rect.minY]);
+  const [x2, y2] = toPixel([rect.maxX, rect.maxY]);
+  ctx.save();
+  ctx.fillStyle = "rgba(24, 144, 255, 0.12)";
+  ctx.strokeStyle = "rgba(24, 144, 255, 0.9)";
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([8, 6]);
+  ctx.fillRect(x1, y1, x2 - x1, y2 - y1);
+  ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+  ctx.restore();
+}
+
 function drawAnnotation(annotation, idx, preview = false) {
   const color = colorFor(annotation.cls || el.classSelect.value);
-  const isSelected = !preview && idx === state.selectedAnnoIdx;
+  const isPrimarySelected = !preview && idx === state.selectedAnnoIdx;
+  const isSelected = !preview && selectionIncludes(idx);
   const isHovered = !preview && idx === state.hoveredAnnoIdx;
   const points = annotation.points;
   if (!points.length) return;
@@ -1079,13 +1262,13 @@ function drawAnnotation(annotation, idx, preview = false) {
   ctx.strokeStyle = isSelected ? "#ffffff" : (isHovered ? "#ffffff" : color);
   if (isSelected || isHovered) {
     ctx.shadowColor = isHovered ? color : "#000";
-    ctx.shadowBlur = isHovered ? 8 : 4;
+    ctx.shadowBlur = isHovered ? 8 : (isPrimarySelected ? 5 : 3);
   }
   ctx.stroke();
   ctx.shadowBlur = 0;
 
   if (points.length >= 3) {
-    ctx.fillStyle = `${color}${isSelected ? "55" : (isHovered ? "35" : "20")}`;
+    ctx.fillStyle = `${color}${isPrimarySelected ? "55" : (isSelected ? "40" : (isHovered ? "35" : "20"))}`;
     ctx.fill();
   }
 
@@ -1097,11 +1280,11 @@ function drawAnnotation(annotation, idx, preview = false) {
   ctx.fillText(label, start[0] + 8, start[1] + 15);
   ctx.shadowBlur = 0;
 
-  if (isSelected) {
+  if (isPrimarySelected) {
     annotation.points.forEach((pt, pointIdx) => drawPoint(pt, pointIdx === state.selectedPointIdx ? "yellow" : "white"));
   }
 
-  if (isSelected && annotation.format === "obb") {
+  if (isPrimarySelected && annotation.format === "obb") {
     const info = getObbHandleInfo(annotation);
     if (info) {
       const [topX, topY] = toPixel(info.topMid);
@@ -1187,9 +1370,11 @@ function renderCanvas() {
     };
     drawAnnotation(preview, -1, true);
     if (state.draft.format === "hbb") {
+      renderSelectionMarquee();
       return;
     }
   }
+  renderSelectionMarquee();
 }
 
 function renderAll() {
@@ -1359,11 +1544,10 @@ function setupEvents() {
         navigateImage(1);
         break;
       case "n":
-        setMode("draw");
-        break;
-      case "enter":
         if (state.mode === "draw" && state.drawFormat === "seg" && state.draft.points.length >= 3) {
           finishSegDraw();
+        } else if (state.mode !== "draw") {
+          setMode("draw");
         }
         break;
       case "escape":

@@ -11,16 +11,24 @@ const CLASS_COLOR_PALETTE = ["#ff4d4f", "#1890ff", "#52c41a", "#faad14", "#722ed
 const state = {
   projects: [],
   teamMembers: [],
-  currentProjectId: null,
   currentView: "home",
-  search: "",
   editingMemberId: null,
   editingClassId: null,
-  remoteMember: null,
-  remoteProjects: [],
-  remoteCurrentProjectId: null,
   memberStatus: {},
-  editingClasses: {},
+  local: {
+    currentProjectId: null,
+    search: "",
+    editingClasses: {},
+  },
+  team: {
+    search: "",
+  },
+  remote: {
+    member: null,
+    projects: [],
+    currentProjectId: null,
+    search: "",
+  },
 };
 
 const el = {
@@ -133,7 +141,7 @@ function packageStatusMeta(status) {
 }
 
 function currentProject() {
-  return state.projects.find((project) => project.id === state.currentProjectId) || null;
+  return state.projects.find((project) => project.id === state.local.currentProjectId) || null;
 }
 
 function hasProject(projectId) {
@@ -159,7 +167,7 @@ function currentProjectClasses() {
 
 function syncEditingClasses() {
   const project = currentProject();
-  state.editingClasses = project ? JSON.parse(JSON.stringify(project.classes || {})) : {};
+  state.local.editingClasses = project ? JSON.parse(JSON.stringify(project.classes || {})) : {};
 }
 
 function currentMode() {
@@ -170,14 +178,32 @@ function currentMode() {
   return "home";
 }
 
+function activeSearchValue() {
+  if (state.currentView === "remote-projects" || state.currentView === "remote-packages") return state.remote.search;
+  if (state.currentView === "team") return state.team.search;
+  return state.local.search;
+}
+
+function setActiveSearchValue(value) {
+  if (state.currentView === "remote-projects" || state.currentView === "remote-packages") {
+    state.remote.search = value;
+    return;
+  }
+  if (state.currentView === "team") {
+    state.team.search = value;
+    return;
+  }
+  state.local.search = value;
+}
+
 function syncHash() {
   let nextHash = "#/home";
   if (state.currentView === "team") {
     nextHash = "#/team";
   } else if (state.currentView === "remote-projects") {
-    nextHash = `#/team/${state.remoteMember?.id || ""}`;
+    nextHash = `#/team/${state.remote.member?.id || ""}`;
   } else if (state.currentView === "remote-packages") {
-    nextHash = `#/team/${state.remoteMember?.id || ""}/project/${state.remoteCurrentProjectId || ""}`;
+    nextHash = `#/team/${state.remote.member?.id || ""}/project/${state.remote.currentProjectId || ""}`;
   } else if (currentProject()) {
     nextHash = `#/project/${currentProject().id}`;
   } else if (state.currentView === "projects") {
@@ -189,41 +215,44 @@ function syncHash() {
 }
 
 function restoreStateFromHash() {
+  clearRemoteContext();
   const hash = window.location.hash || "#/home";
   const projectMatch = hash.match(/^#\/project\/(.+)$/);
   const remoteProjectMatch = hash.match(/^#\/team\/([^/]+)\/project\/(.+)$/);
   const remoteMemberMatch = hash.match(/^#\/team\/([^/]+)$/);
   if (hash === "#/team") {
     state.currentView = "team";
-    state.currentProjectId = null;
+    state.local.currentProjectId = null;
     return;
   }
   if (remoteProjectMatch) {
     state.currentView = "remote-packages";
-    state.currentProjectId = null;
-    state.remoteMember = { id: decodeURIComponent(remoteProjectMatch[1]) };
-    state.remoteCurrentProjectId = decodeURIComponent(remoteProjectMatch[2]);
+    state.local.currentProjectId = null;
+    state.remote.member = { id: decodeURIComponent(remoteProjectMatch[1]) };
+    state.remote.currentProjectId = decodeURIComponent(remoteProjectMatch[2]);
+    state.team.search = "";
     return;
   }
   if (remoteMemberMatch) {
     state.currentView = "remote-projects";
-    state.currentProjectId = null;
-    state.remoteMember = { id: decodeURIComponent(remoteMemberMatch[1]) };
-    state.remoteCurrentProjectId = null;
+    state.local.currentProjectId = null;
+    state.remote.member = { id: decodeURIComponent(remoteMemberMatch[1]) };
+    state.remote.currentProjectId = null;
+    state.team.search = "";
     return;
   }
   if (hash === "#/projects") {
     state.currentView = "projects";
-    state.currentProjectId = null;
+    state.local.currentProjectId = null;
     return;
   }
   if (projectMatch) {
     state.currentView = "projects";
-    state.currentProjectId = decodeURIComponent(projectMatch[1]);
+    state.local.currentProjectId = decodeURIComponent(projectMatch[1]);
     return;
   }
   state.currentView = "home";
-  state.currentProjectId = null;
+  state.local.currentProjectId = null;
 }
 
 function showStatus(message, type = "info") {
@@ -296,48 +325,59 @@ function openMemberEditDialog(memberId) {
 function updateNavigation() {
   el.homeNavBtn.classList.toggle("active", state.currentView === "home");
   el.projectNavBtn.classList.toggle("active", state.currentView === "projects");
-  el.teamNavBtn.classList.toggle("active", state.currentView === "team");
+  el.teamNavBtn.classList.toggle("active", state.currentView === "team" || state.currentView === "remote-projects" || state.currentView === "remote-packages");
 }
 
 function resetSearch() {
-  state.search = "";
+  setActiveSearchValue("");
   el.searchInput.value = "";
 }
 
+function clearRemoteContext() {
+  state.remote.member = null;
+  state.remote.projects = [];
+  state.remote.currentProjectId = null;
+  state.remote.search = "";
+}
+
 function setHomeView() {
+  clearRemoteContext();
   state.currentView = "home";
-  state.currentProjectId = null;
+  state.local.currentProjectId = null;
 }
 
 function setProjectsView(projectId = null) {
+  clearRemoteContext();
   state.currentView = "projects";
-  state.currentProjectId = projectId;
+  state.local.currentProjectId = projectId;
   syncEditingClasses();
 }
 
 function setTeamView() {
+  clearRemoteContext();
   state.currentView = "team";
-  state.currentProjectId = null;
+  state.local.currentProjectId = null;
 }
 
 function setRemoteProjectsView(member, projects = []) {
   state.currentView = "remote-projects";
-  state.currentProjectId = null;
-  state.remoteMember = member;
-  state.remoteProjects = projects;
-  state.remoteCurrentProjectId = null;
+  state.local.currentProjectId = null;
+  state.remote.member = member;
+  state.remote.projects = projects;
+  state.remote.currentProjectId = null;
 }
 
 function setRemotePackagesView(member, projectId) {
   state.currentView = "remote-packages";
-  state.currentProjectId = null;
-  state.remoteMember = member;
-  state.remoteCurrentProjectId = projectId;
+  state.local.currentProjectId = null;
+  state.remote.member = member;
+  state.remote.currentProjectId = projectId;
 }
 
 function updateHeader() {
   const mode = currentMode();
   document.body.classList.toggle("home-mode", mode === "home");
+  el.searchInput.value = activeSearchValue();
   if (mode === "home") {
     el.scopeLabel.textContent = "";
     el.searchInput.placeholder = "Search dashboard";
@@ -359,8 +399,8 @@ function updateHeader() {
   }
 
   if (mode === "remote") {
-    const memberName = state.remoteMember?.name || "远端";
-    const remoteProject = state.remoteProjects.find((item) => item.id === state.remoteCurrentProjectId);
+    const memberName = state.remote.member?.name || "远端";
+    const remoteProject = state.remote.projects.find((item) => item.id === state.remote.currentProjectId);
     el.scopeLabel.textContent = remoteProject ? `${memberName} / ${remoteProject.name}` : `${memberName} / 项目`;
     el.createBtn.hidden = true;
     el.searchInput.hidden = false;
@@ -386,13 +426,13 @@ function updateHeader() {
 
 function filteredProjects() {
   if (state.currentView === "remote-projects") {
-    const query = state.search.trim().toLowerCase();
-    if (!query) return state.remoteProjects;
-    return state.remoteProjects.filter((project) =>
+    const query = state.remote.search.trim().toLowerCase();
+    if (!query) return state.remote.projects;
+    return state.remote.projects.filter((project) =>
       [project.name, project.id, project.description].some((part) => String(part).toLowerCase().includes(query)),
     );
   }
-  const query = state.search.trim().toLowerCase();
+  const query = state.local.search.trim().toLowerCase();
   if (!query) return state.projects;
   return state.projects.filter((project) =>
     [project.name, project.id, project.description].some((part) => String(part).toLowerCase().includes(query)),
@@ -401,7 +441,7 @@ function filteredProjects() {
 
 function filteredPackages(project) {
   if (state.currentView === "remote-packages") {
-    const query = state.search.trim().toLowerCase();
+    const query = state.remote.search.trim().toLowerCase();
     const packages = project?.packages || [];
     if (!query) return packages;
     return packages.filter((item) =>
@@ -409,7 +449,7 @@ function filteredPackages(project) {
         .some((part) => String(part).toLowerCase().includes(query)),
     );
   }
-  const query = state.search.trim().toLowerCase();
+  const query = state.local.search.trim().toLowerCase();
   if (!query) return project.packages;
   return project.packages.filter((item) =>
     [item.name, item.remark, item.imagesPath, item.labelsPath, item.format, packageStatusMeta(item.status).label].some((part) =>
@@ -419,7 +459,7 @@ function filteredPackages(project) {
 }
 
 function filteredMembers() {
-  const query = state.search.trim().toLowerCase();
+  const query = state.team.search.trim().toLowerCase();
   if (!query) return state.teamMembers;
   return state.teamMembers.filter((member) =>
     [member.name, member.ip, member.username, member.password, member.homeUrl, member.remark]
@@ -442,7 +482,7 @@ function renderClassSection(project) {
     return;
   }
 
-  const classes = classEntries(state.editingClasses);
+  const classes = classEntries(state.local.editingClasses);
   el.classSection.hidden = false;
   el.classList.innerHTML = classes.map(([key, value]) => `
     <article class="class-pill" style="--pill-color:${escapeAttr(value.color || "#888888")}" data-edit-class="${escapeAttr(key)}">
@@ -574,7 +614,7 @@ function renderProjects() {
 function renderRemoteProjects() {
   const projects = filteredProjects();
   if (!projects.length) {
-    renderEmpty(state.remoteProjects.length ? "没有匹配的远端项目。" : "对方还没有项目。");
+    renderEmpty(state.remote.projects.length ? "没有匹配的远端项目。" : "对方还没有项目。");
     return;
   }
 
@@ -751,7 +791,7 @@ function render() {
       renderRemoteProjects();
       return;
     }
-    const remoteProject = state.remoteProjects.find((item) => item.id === state.remoteCurrentProjectId);
+    const remoteProject = state.remote.projects.find((item) => item.id === state.remote.currentProjectId);
     if (!remoteProject) {
       renderEmpty("远端项目不存在或已变更。");
       return;
@@ -782,8 +822,8 @@ async function request(url, options = {}) {
 async function loadProjects() {
   const payload = await request("/api/projects");
   state.projects = Array.isArray(payload.projects) ? payload.projects : [];
-  if (state.currentProjectId && !currentProject()) {
-    state.currentProjectId = null;
+  if (state.local.currentProjectId && !currentProject()) {
+    state.local.currentProjectId = null;
     state.currentView = "projects";
   }
   if (currentProject()) syncEditingClasses();
@@ -817,7 +857,7 @@ async function refreshAll({ silentTeamError = true } = {}) {
     state.memberStatus = {};
     if (!silentTeamError) throw error;
   }
-  if (state.currentProjectId && !hasProject(state.currentProjectId)) {
+  if (state.local.currentProjectId && !hasProject(state.local.currentProjectId)) {
     setProjectsView();
     showStatus("项目不存在或已被删除", "error");
   }
@@ -841,29 +881,29 @@ async function createProject(event) {
 
 function nextClassId() {
   let id = 0;
-  while (state.editingClasses[String(id)]) id += 1;
+  while (state.local.editingClasses[String(id)]) id += 1;
   return String(id);
 }
 
 function addClassRow() {
   const key = nextClassId();
-  const color = CLASS_COLOR_PALETTE[Object.keys(state.editingClasses).length % CLASS_COLOR_PALETTE.length];
-  state.editingClasses[key] = { name: `class_${key}`, color };
+  const color = CLASS_COLOR_PALETTE[Object.keys(state.local.editingClasses).length % CLASS_COLOR_PALETTE.length];
+  state.local.editingClasses[key] = { name: `class_${key}`, color };
   openClassDialog(key, true);
 }
 
 function deleteClassRow(classId) {
-  const remaining = Object.keys(state.editingClasses).length;
+  const remaining = Object.keys(state.local.editingClasses).length;
   if (remaining <= 1) {
     showStatus("至少保留一个类别", "error");
     return;
   }
-  delete state.editingClasses[classId];
+  delete state.local.editingClasses[classId];
   renderClassSection(currentProject());
 }
 
 function openClassDialog(classId, isNew = false) {
-  const item = state.editingClasses[classId];
+  const item = state.local.editingClasses[classId];
   if (!item) return;
   state.editingClassId = classId;
   el.classDialogTitle.textContent = isNew ? "新增类别" : "编辑类别";
@@ -885,7 +925,7 @@ async function saveProjectClasses() {
   const payload = await request(`/api/projects/${encodeURIComponent(project.id)}/classes`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ classes: state.editingClasses }),
+    body: JSON.stringify({ classes: state.local.editingClasses }),
   });
   const target = state.projects.find((item) => item.id === project.id);
   if (target) {
@@ -903,7 +943,7 @@ async function deleteProject(projectId) {
   await request(`/api/projects/${encodeURIComponent(projectId)}`, {
     method: "DELETE",
   });
-  if (state.currentProjectId === projectId) {
+  if (state.local.currentProjectId === projectId) {
     setProjectsView();
   }
   showStatus("项目已删除");
@@ -974,20 +1014,20 @@ async function openMemberHome(memberId) {
 async function openRemoteProject(memberId, projectId) {
   const payload = await request(`/api/team/${encodeURIComponent(memberId)}/projects/${encodeURIComponent(projectId)}`);
   if (!payload.project) throw new Error("远端项目不存在");
-  const member = state.remoteMember && state.remoteMember.id === memberId
-    ? state.remoteMember
+  const member = state.remote.member && state.remote.member.id === memberId
+    ? state.remote.member
     : state.teamMembers.find((item) => item.id === memberId) || payload.member;
-  const nextProjects = state.remoteProjects.filter((item) => item.id !== payload.project.id);
+  const nextProjects = state.remote.projects.filter((item) => item.id !== payload.project.id);
   nextProjects.push(payload.project);
-  state.remoteProjects = nextProjects;
+  state.remote.projects = nextProjects;
   setRemotePackagesView(member, payload.project.id);
   render();
 }
 
 async function updateRemotePackageStatus(packageId, status) {
-  if (!state.remoteMember || !state.remoteCurrentProjectId) return;
+  if (!state.remote.member || !state.remote.currentProjectId) return;
   const payload = await request(
-    `/api/team/${encodeURIComponent(state.remoteMember.id)}/projects/${encodeURIComponent(state.remoteCurrentProjectId)}/packages/${encodeURIComponent(packageId)}`,
+    `/api/team/${encodeURIComponent(state.remote.member.id)}/projects/${encodeURIComponent(state.remote.currentProjectId)}/packages/${encodeURIComponent(packageId)}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -995,21 +1035,24 @@ async function updateRemotePackageStatus(packageId, status) {
     },
   );
   showStatus(`远端状态已更新为“${payload.statusLabel}”`);
-  await openRemoteProject(state.remoteMember.id, state.remoteCurrentProjectId);
+  await openRemoteProject(state.remote.member.id, state.remote.currentProjectId);
 }
 
 function openRemoteAnnotator(packageId) {
-  if (!state.remoteMember || !state.remoteCurrentProjectId) return;
-  const project = state.remoteProjects.find((item) => item.id === state.remoteCurrentProjectId);
+  if (!state.remote.member || !state.remote.currentProjectId) return;
+  const project = state.remote.projects.find((item) => item.id === state.remote.currentProjectId);
   const item = project?.packages?.find((pack) => pack.id === packageId);
   if (!project || !item) return;
-  const base = String(state.remoteMember.homeUrl || "").replace(/\/+$/, "");
+  const base = String(state.remote.member.homeUrl || "").replace(/\/+$/, "");
+  const returnUrl = `${window.location.origin}${window.location.pathname}#/team`;
   const params = new URLSearchParams({
     projectId: project.id,
     packageId: item.id,
     projectName: project.name,
     packageName: item.name,
     format: item.format || "seg",
+    returnUrl,
+    returnLabel: "团队",
   });
   window.open(`${base}/annotator?${params.toString()}`, "_blank", "noopener");
 }
@@ -1067,7 +1110,7 @@ function handleViewJump(view) {
 }
 
 el.searchInput.addEventListener("input", (event) => {
-  state.search = event.target.value;
+  setActiveSearchValue(event.target.value);
   render();
 });
 
@@ -1085,8 +1128,8 @@ el.createBtn.addEventListener("click", () => {
 });
 
 el.backBtn.addEventListener("click", () => {
-  if (state.currentView === "remote-packages" && state.remoteMember) {
-    setRemoteProjectsView(state.remoteMember, state.remoteProjects);
+  if (state.currentView === "remote-packages" && state.remote.member) {
+    setRemoteProjectsView(state.remote.member, state.remote.projects);
     render();
     return;
   }
@@ -1138,8 +1181,8 @@ el.classModelBtn.addEventListener("click", () => {
 el.classForm.addEventListener("submit", (event) => {
   event.preventDefault();
   const classId = state.editingClassId;
-  if (!classId || !state.editingClasses[classId]) return;
-  state.editingClasses[classId] = {
+  if (!classId || !state.local.editingClasses[classId]) return;
+  state.local.editingClasses[classId] = {
     name: el.classNameInput.value.trim() || classId,
     color: el.classColorInput.value,
   };
@@ -1210,8 +1253,8 @@ el.grid.addEventListener("click", (event) => {
   }
 
   const remoteProjectCard = event.target.closest("[data-open-remote-project]");
-  if (remoteProjectCard && state.remoteMember) {
-    openRemoteProject(state.remoteMember.id, remoteProjectCard.dataset.openRemoteProject).catch((error) => showStatus(error.message, "error"));
+  if (remoteProjectCard && state.remote.member) {
+    openRemoteProject(state.remote.member.id, remoteProjectCard.dataset.openRemoteProject).catch((error) => showStatus(error.message, "error"));
     return;
   }
 
@@ -1343,7 +1386,7 @@ window.setInterval(updateClock, 1000);
 
 window.addEventListener("hashchange", () => {
   restoreStateFromHash();
-  if (state.currentProjectId && !hasProject(state.currentProjectId)) {
+  if (state.local.currentProjectId && !hasProject(state.local.currentProjectId)) {
     setProjectsView();
     showStatus("项目不存在或已被删除", "error");
   }
