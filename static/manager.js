@@ -255,6 +255,28 @@ function restoreStateFromHash() {
   state.local.currentProjectId = null;
 }
 
+async function hydrateRemoteContext() {
+  if (state.currentView !== "remote-projects" && state.currentView !== "remote-packages") return;
+  const memberId = state.remote.member?.id;
+  if (!memberId) return;
+
+  const payload = await request(`/api/team/${encodeURIComponent(memberId)}/projects`);
+  if (state.currentView !== "remote-projects" && state.currentView !== "remote-packages") return;
+  if (state.remote.member?.id !== memberId) return;
+
+  state.remote.member = payload.member || state.teamMembers.find((item) => item.id === memberId) || state.remote.member;
+  state.remote.projects = Array.isArray(payload.projects) ? payload.projects : [];
+
+  if (state.currentView === "remote-packages" && state.remote.currentProjectId) {
+    const exists = state.remote.projects.some((item) => item.id === state.remote.currentProjectId);
+    if (!exists) {
+      state.remote.currentProjectId = null;
+      state.currentView = "remote-projects";
+      showStatus("远端项目不存在或已变更", "error");
+    }
+  }
+}
+
 function showStatus(message, type = "info") {
   el.statusBanner.textContent = message;
   el.statusBanner.className = `status-banner${type === "error" ? " error" : ""}`;
@@ -470,7 +492,6 @@ function filteredMembers() {
 function renderEmpty(text) {
   el.grid.innerHTML = "";
   el.teamList.innerHTML = "";
-  if (el.classList) el.classList.innerHTML = "";
   el.emptyText.textContent = text;
   el.emptyState.hidden = false;
 }
@@ -485,8 +506,10 @@ function renderClassSection(project) {
   const classes = classEntries(state.local.editingClasses);
   el.classSection.hidden = false;
   el.classList.innerHTML = classes.map(([key, value]) => `
-    <article class="class-pill" style="--pill-color:${escapeAttr(value.color || "#888888")}" data-edit-class="${escapeAttr(key)}">
-      <span class="class-pill-name">${escapeHtml(value.name || key)}</span>
+    <article class="class-pill" style="--pill-color:${escapeAttr(value.color || "#888888")}">
+      <button class="class-pill-main" type="button" title="编辑标签" data-edit-class="${escapeAttr(key)}">
+        <span class="class-pill-name">${escapeHtml(value.name || key)}</span>
+      </button>
       <span class="class-pill-actions">
         <button class="class-pill-icon" type="button" title="编辑" data-edit-class="${escapeAttr(key)}">✎</button>
         <button class="class-pill-icon" type="button" title="删除" data-delete-class="${escapeAttr(key)}">🗑</button>
@@ -857,6 +880,13 @@ async function refreshAll({ silentTeamError = true } = {}) {
     state.memberStatus = {};
     if (!silentTeamError) throw error;
   }
+  try {
+    await hydrateRemoteContext();
+  } catch (error) {
+    console.error(error);
+    if (!silentTeamError) throw error;
+    showStatus(error.message, "error");
+  }
   if (state.local.currentProjectId && !hasProject(state.local.currentProjectId)) {
     setProjectsView();
     showStatus("项目不存在或已被删除", "error");
@@ -1044,7 +1074,7 @@ function openRemoteAnnotator(packageId) {
   const item = project?.packages?.find((pack) => pack.id === packageId);
   if (!project || !item) return;
   const base = String(state.remote.member.homeUrl || "").replace(/\/+$/, "");
-  const returnUrl = `${window.location.origin}${window.location.pathname}#/team`;
+  const returnUrl = `${window.location.origin}${window.location.pathname}#/team/${encodeURIComponent(state.remote.member.id)}/project/${encodeURIComponent(project.id)}`;
   const params = new URLSearchParams({
     projectId: project.id,
     packageId: item.id,
@@ -1052,7 +1082,7 @@ function openRemoteAnnotator(packageId) {
     packageName: item.name,
     format: item.format || "seg",
     returnUrl,
-    returnLabel: "团队",
+    returnLabel: "团队审核",
   });
   window.open(`${base}/annotator?${params.toString()}`, "_blank", "noopener");
 }
@@ -1081,18 +1111,15 @@ async function deletePackage(packageId) {
 }
 
 async function openAnnotator(projectId, packageId) {
-  const payload = await request(`/api/projects/${encodeURIComponent(projectId)}/packages/${encodeURIComponent(packageId)}/activate`, {
-    method: "POST",
-  });
-  const project = payload.project;
-  const item = payload.package;
+  const project = state.projects.find((entry) => entry.id === projectId);
+  const item = project?.packages?.find((entry) => entry.id === packageId);
+  if (!project || !item) throw new Error("项目或数据包不存在");
   const params = new URLSearchParams({
     projectId: project.id,
     packageId: item.id,
     projectName: project.name,
     packageName: item.name,
     format: item.format || "seg",
-    activated: "1",
   });
   window.location.href = `/annotator?${params.toString()}`;
 }
@@ -1386,11 +1413,9 @@ window.setInterval(updateClock, 1000);
 
 window.addEventListener("hashchange", () => {
   restoreStateFromHash();
-  if (state.local.currentProjectId && !hasProject(state.local.currentProjectId)) {
-    setProjectsView();
-    showStatus("项目不存在或已被删除", "error");
-  }
-  render();
+  refreshAll().catch((error) => {
+    showStatus(error.message, "error");
+  });
 });
 
 refreshAll().catch((error) => {

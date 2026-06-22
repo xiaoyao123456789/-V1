@@ -24,9 +24,23 @@ const state = {
   drawFormat: "seg",
   packageFormat: "seg",
   annotations: [],
+  packageStats: {
+    imageCount: 0,
+    labeledImageCount: 0,
+    totalObjects: 0,
+    classCounts: {},
+    loading: false,
+    error: "",
+  },
   draft: {
     format: "seg",
     points: [],
+  },
+  review: {
+    sessionEnabled: false,
+    showDeleted: false,
+    deletedSnapshots: [],
+    addedSnapshots: [],
   },
   mousePos: null,
   selectedAnnoIdx: -1,
@@ -54,6 +68,12 @@ const el = {
   brandLink: document.getElementById("annotatorHomeLink"),
   modeBadge: document.getElementById("mode-badge"),
   zoomBadge: document.getElementById("zoom-badge"),
+  statsBtn: document.getElementById("stats-btn"),
+  statsModal: document.getElementById("stats-modal"),
+  statsCloseBtn: document.getElementById("stats-close-btn"),
+  statsTableBody: document.getElementById("stats-table-body"),
+  statsTotal: document.getElementById("stats-total"),
+  statsEmpty: document.getElementById("stats-empty"),
   saveBtn: document.getElementById("btn-save"),
   deleteCurrentBtn: document.getElementById("delete-current-btn"),
   prevBtn: document.getElementById("btn-prev"),
@@ -98,6 +118,31 @@ function pageParams() {
   return new URLSearchParams(window.location.search);
 }
 
+function isReviewSession() {
+  return state.review.sessionEnabled;
+}
+
+function roundPointValue(value) {
+  return Number(Number(value || 0).toFixed(6));
+}
+
+function annotationSignature(annotation) {
+  const points = Array.isArray(annotation?.points) ? annotation.points.map(([x, y]) => [roundPointValue(x), roundPointValue(y)]) : [];
+  return JSON.stringify({
+    cls: String(annotation?.cls ?? ""),
+    format: String(annotation?.format ?? "seg"),
+    points,
+  });
+}
+
+function cloneReviewEntries(items = []) {
+  return items.map((item) => ({
+    cls: String(item.cls),
+    format: item.format || "seg",
+    points: item.points.map(([x, y]) => [x, y]),
+  }));
+}
+
 function currentItem() {
   return imagesData[currentIndex] || null;
 }
@@ -115,6 +160,7 @@ function cloneAnnotations(items = state.annotations) {
     cls: String(item.cls),
     format: item.format || "seg",
     visible: item.visible !== false,
+    reviewAdded: item.reviewAdded === true,
     points: item.points.map(([x, y]) => [x, y]),
   }));
 }
@@ -122,6 +168,10 @@ function cloneAnnotations(items = state.annotations) {
 function saveState() {
   state.historyStack.push(JSON.stringify({
     annotations: cloneAnnotations(),
+    review: {
+      deletedSnapshots: cloneReviewEntries(state.review.deletedSnapshots),
+      addedSnapshots: cloneReviewEntries(state.review.addedSnapshots),
+    },
     draft: {
       format: state.draft.format,
       points: state.draft.points.map(([x, y]) => [x, y]),
@@ -134,6 +184,8 @@ function undo() {
   if (!state.historyStack.length) return;
   const previous = JSON.parse(state.historyStack.pop());
   state.annotations = previous.annotations;
+  state.review.deletedSnapshots = cloneReviewEntries(previous.review?.deletedSnapshots || []);
+  state.review.addedSnapshots = cloneReviewEntries(previous.review?.addedSnapshots || []);
   state.draft = previous.draft;
   clearSelection();
   state.dragging = null;
@@ -204,6 +256,97 @@ function updateModeBadge() {
 function updateZoomBadge() {
   if (!el.zoomBadge) return;
   el.zoomBadge.textContent = `${Math.round(state.view.scale * 100)}%`;
+}
+
+function resetReviewState() {
+  state.review.showDeleted = false;
+  state.review.deletedSnapshots = [];
+  state.review.addedSnapshots = [];
+}
+
+function resetPackageStats() {
+  state.packageStats = {
+    imageCount: 0,
+    labeledImageCount: 0,
+    totalObjects: 0,
+    classCounts: {},
+    loading: false,
+    error: "",
+  };
+}
+
+function renderStatsModal() {
+  if (!el.statsTableBody || !el.statsTotal || !el.statsEmpty) return;
+  const stats = state.packageStats || {};
+  const counts = stats.classCounts && typeof stats.classCounts === "object" ? stats.classCounts : {};
+  const rows = Object.entries(counts).sort((a, b) => a[0].localeCompare(b[0], "zh-CN", { numeric: true }));
+  el.statsTableBody.innerHTML = rows.map(([cls, count]) => `
+    <tr>
+      <td>${escapeHtml(classNameFor(cls))}</td>
+      <td>${escapeHtml(cls)}</td>
+      <td>${count}</td>
+    </tr>
+  `).join("");
+  el.statsTotal.textContent = String(stats.totalObjects || 0);
+  if (stats.loading) {
+    el.statsEmpty.textContent = "统计加载中...";
+    el.statsEmpty.hidden = false;
+    return;
+  }
+  if (stats.error) {
+    el.statsEmpty.textContent = stats.error;
+    el.statsEmpty.hidden = false;
+    return;
+  }
+  el.statsEmpty.textContent = rows.length
+    ? `共 ${stats.imageCount || 0} 张图，已有 ${stats.labeledImageCount || 0} 张带标注。`
+    : "这个数据包里还没有标注对象。";
+  el.statsEmpty.hidden = rows.length > 0;
+}
+
+async function fetchPackageStats() {
+  state.packageStats.loading = true;
+  state.packageStats.error = "";
+  renderStatsModal();
+  try {
+    const response = await fetch("/api/package-stats");
+    const payload = await response.json();
+    if (!response.ok || !payload.stats) {
+      throw new Error(payload.datasetError || "加载数据包统计失败");
+    }
+    state.packageStats = {
+      imageCount: Number(payload.stats.imageCount || 0),
+      labeledImageCount: Number(payload.stats.labeledImageCount || 0),
+      totalObjects: Number(payload.stats.totalObjects || 0),
+      classCounts: payload.stats.classCounts || {},
+      loading: false,
+      error: "",
+    };
+  } catch (error) {
+    state.packageStats = {
+      imageCount: 0,
+      labeledImageCount: 0,
+      totalObjects: 0,
+      classCounts: {},
+      loading: false,
+      error: error.message || "加载数据包统计失败",
+    };
+  }
+  renderStatsModal();
+}
+
+async function openStatsModal() {
+  if (state.autoSaveTimer) {
+    clearTimeout(state.autoSaveTimer);
+    state.autoSaveTimer = null;
+    await saveAnnotations(true);
+  }
+  el.statsModal.hidden = false;
+  await fetchPackageStats();
+}
+
+function closeStatsModal() {
+  el.statsModal.hidden = true;
 }
 
 function clamp(value, min, max) {
@@ -291,9 +434,9 @@ async function activatePackageFromQuery() {
   const packageId = params.get("packageId");
   const packageName = params.get("packageName");
   const packageFormat = String(params.get("format") || "seg").toLowerCase();
-  const activated = params.get("activated");
   const returnUrl = params.get("returnUrl");
   const returnLabel = params.get("returnLabel");
+  state.review.sessionEnabled = Boolean(returnUrl);
 
   if (packageName) {
     document.title = `${packageName} - 标注器`;
@@ -311,7 +454,7 @@ async function activatePackageFromQuery() {
     el.brandLink.href = `/#/project/${encodeURIComponent(projectId)}`;
   }
 
-  if (!projectId || !packageId || activated === "1") return;
+  if (!projectId || !packageId) return;
 
   const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/packages/${encodeURIComponent(packageId)}/activate`, {
     method: "POST",
@@ -383,6 +526,7 @@ async function selectImage(index) {
   state.mode = "select";
   state.drawFormat = state.packageFormat;
   state.annotations = [];
+  resetReviewState();
   state.draft = { format: state.packageFormat, points: [] };
   state.mousePos = null;
   state.selectedAnnoIdx = -1;
@@ -408,11 +552,15 @@ async function selectImage(index) {
   imgEl.src = img.imageUrl;
 
   try {
-    const res = await fetch(`/api/annotations/${encodeURIComponent(img.id)}`);
-    if (res.ok) {
-      const data = await res.json();
+    const [annotationResponse] = await Promise.all([
+      fetch(`/api/annotations/${encodeURIComponent(img.id)}`),
+      fetchReviewSnapshot(img.id),
+    ]);
+    if (annotationResponse.ok) {
+      const data = await annotationResponse.json();
       if (Array.isArray(data.annotations)) {
         state.annotations = data.annotations.map(normalizeAnnotation).filter(Boolean);
+        syncReviewAddedMarkers();
       }
     }
   } catch (error) {
@@ -429,8 +577,79 @@ function normalizeAnnotation(item) {
     cls: String(item.cls ?? "0"),
     format,
     visible: item.visible !== false,
+    reviewAdded: item.reviewAdded === true,
     points: item.points.map(([x, y]) => [Number(x), Number(y)]),
   };
+}
+
+function syncReviewAddedMarkers() {
+  const counts = new Map();
+  state.review.addedSnapshots.forEach((annotation) => {
+    const signature = annotationSignature(annotation);
+    counts.set(signature, (counts.get(signature) || 0) + 1);
+  });
+  state.annotations.forEach((annotation) => {
+    const signature = annotationSignature(annotation);
+    const remaining = counts.get(signature) || 0;
+    annotation.reviewAdded = remaining > 0;
+    if (remaining > 0) counts.set(signature, remaining - 1);
+  });
+}
+
+async function fetchReviewSnapshot(itemId) {
+  resetReviewState();
+  try {
+    const response = await fetch(`/api/review-snapshots/${encodeURIComponent(itemId)}`);
+    if (!response.ok) return;
+    const payload = await response.json();
+    const snapshot = payload.snapshot || {};
+    state.review.deletedSnapshots = Array.isArray(snapshot.deleted)
+      ? snapshot.deleted.map(normalizeAnnotation).filter(Boolean)
+      : [];
+    state.review.addedSnapshots = Array.isArray(snapshot.added)
+      ? snapshot.added.map(normalizeAnnotation).filter(Boolean)
+      : [];
+    syncReviewAddedMarkers();
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+async function persistReviewSnapshot() {
+  const item = currentItem();
+  if (!item || !isReviewSession()) return;
+  const payload = {
+    deleted: state.review.deletedSnapshots.map((annotation) => ({
+      cls: annotation.cls,
+      format: annotation.format,
+      points: annotation.points,
+    })),
+    added: state.annotations
+      .filter((annotation) => annotation.reviewAdded)
+      .map((annotation) => ({
+        cls: annotation.cls,
+        format: annotation.format,
+        points: annotation.points,
+      })),
+  };
+  state.review.addedSnapshots = payload.added.map(normalizeAnnotation).filter(Boolean);
+  const response = await fetch(`/api/review-snapshots/${encodeURIComponent(item.id)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const message = await response.text();
+    throw new Error(message || "保存审核闪照失败");
+  }
+}
+
+function rememberDeletedReviewAnnotations(annotations) {
+  if (!isReviewSession()) return;
+  annotations.forEach((annotation) => {
+    if (!annotation || annotation.reviewAdded) return;
+    state.review.deletedSnapshots.push(normalizeAnnotation(annotation));
+  });
 }
 
 function renderObjectList() {
@@ -494,7 +713,10 @@ function toggleVisibility(event, idx) {
 
 function deleteObject(event, idx) {
   event.stopPropagation();
+  const target = state.annotations[idx];
+  if (!target) return;
   saveState();
+  rememberDeletedReviewAnnotations([target]);
   state.annotations.splice(idx, 1);
   const nextSelection = state.selectedAnnoIndices
     .filter((item) => item !== idx)
@@ -806,6 +1028,7 @@ function finishBoxDraw() {
     cls: el.classSelect.value,
     format: state.draft.format,
     visible: true,
+    reviewAdded: isReviewSession(),
     points: state.draft.points.map(([x, y]) => [x, y]),
   };
   state.annotations.push(annotation);
@@ -824,6 +1047,7 @@ function finishSegDraw() {
     cls: el.classSelect.value,
     format: "seg",
     visible: true,
+    reviewAdded: isReviewSession(),
     points: state.draft.points.map(([x, y]) => [x, y]),
   });
   setSingleSelection(state.annotations.length - 1);
@@ -1117,15 +1341,18 @@ function deleteSelection() {
       annotation.points.splice(state.selectedPointIdx, 1);
       state.selectedPointIdx = -1;
       if (annotation.points.length < 3) {
+        rememberDeletedReviewAnnotations([annotation]);
         state.annotations.splice(state.selectedAnnoIdx, 1);
         clearSelection();
       }
     } else {
+      rememberDeletedReviewAnnotations([annotation]);
       state.annotations.splice(state.selectedAnnoIdx, 1);
       clearSelection();
     }
   } else {
     const selectedSet = new Set(state.selectedAnnoIndices);
+    rememberDeletedReviewAnnotations(state.annotations.filter((_, idx) => selectedSet.has(idx)));
     state.annotations = state.annotations.filter((_, idx) => !selectedSet.has(idx));
     clearSelection();
   }
@@ -1241,6 +1468,62 @@ function renderSelectionMarquee() {
   ctx.restore();
 }
 
+function annotationGradient(annotation) {
+  const bounds = annotationBounds(annotation);
+  const [x1, y1] = toPixel([bounds.minX, bounds.minY]);
+  const [x2, y2] = toPixel([bounds.maxX, bounds.maxY]);
+  const gradient = ctx.createLinearGradient(x1, y1, Math.max(x1 + 1, x2), Math.max(y1 + 1, y2));
+  gradient.addColorStop(0, "#ff4d4f");
+  gradient.addColorStop(0.2, "#fa8c16");
+  gradient.addColorStop(0.4, "#fadb14");
+  gradient.addColorStop(0.6, "#52c41a");
+  gradient.addColorStop(0.8, "#1890ff");
+  gradient.addColorStop(1, "#eb2f96");
+  return gradient;
+}
+
+function traceAnnotationPath(points) {
+  if (!points.length) return false;
+  const start = toPixel(points[0]);
+  ctx.beginPath();
+  ctx.moveTo(start[0], start[1]);
+  for (let i = 1; i < points.length; i += 1) {
+    const [x, y] = toPixel(points[i]);
+    ctx.lineTo(x, y);
+  }
+  if (points.length >= 3) ctx.closePath();
+  return true;
+}
+
+function drawDeletedReviewAnnotation(annotation) {
+  if (!annotation?.points?.length) return;
+  const color = colorFor(annotation.cls || el.classSelect.value);
+  ctx.save();
+  traceAnnotationPath(annotation.points);
+  ctx.lineWidth = 2;
+  ctx.setLineDash([10, 6]);
+  ctx.strokeStyle = color;
+  ctx.globalAlpha = 0.9;
+  ctx.stroke();
+  ctx.setLineDash([]);
+  const [x, y] = toPixel(annotation.points[0]);
+  ctx.fillStyle = color;
+  ctx.font = "12px sans-serif";
+  ctx.fillText(`原:${classNameFor(annotation.cls || "")}`, x + 8, y - 8);
+  ctx.restore();
+}
+
+function drawReviewAddedHalo(annotation) {
+  if (!annotation?.reviewAdded || !annotation?.points?.length) return;
+  ctx.save();
+  traceAnnotationPath(annotation.points);
+  ctx.lineWidth = 6;
+  ctx.strokeStyle = annotationGradient(annotation);
+  ctx.globalAlpha = 0.85;
+  ctx.stroke();
+  ctx.restore();
+}
+
 function drawAnnotation(annotation, idx, preview = false) {
   const color = colorFor(annotation.cls || el.classSelect.value);
   const isPrimarySelected = !preview && idx === state.selectedAnnoIdx;
@@ -1249,14 +1532,12 @@ function drawAnnotation(annotation, idx, preview = false) {
   const points = annotation.points;
   if (!points.length) return;
 
-  ctx.beginPath();
-  const start = toPixel(points[0]);
-  ctx.moveTo(start[0], start[1]);
-  for (let i = 1; i < points.length; i += 1) {
-    const [x, y] = toPixel(points[i]);
-    ctx.lineTo(x, y);
+  if (!preview) {
+    drawReviewAddedHalo(annotation);
   }
-  if (points.length >= 3) ctx.closePath();
+
+  traceAnnotationPath(points);
+  const start = toPixel(points[0]);
 
   ctx.lineWidth = isSelected || isHovered ? 3 : 2;
   ctx.strokeStyle = isSelected ? "#ffffff" : (isHovered ? "#ffffff" : color);
@@ -1309,6 +1590,10 @@ function drawAnnotation(annotation, idx, preview = false) {
 
 function renderCanvas() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (state.review.showDeleted) {
+    state.review.deletedSnapshots.forEach((annotation) => drawDeletedReviewAnnotation(annotation));
+  }
 
   state.annotations.forEach((annotation, idx) => {
     if (!annotation.visible) return;
@@ -1380,6 +1665,9 @@ function renderCanvas() {
 function renderAll() {
   renderCanvas();
   renderObjectList();
+  if (el.statsModal && !el.statsModal.hidden) {
+    renderStatsModal();
+  }
 }
 
 function triggerAutoSave() {
@@ -1415,11 +1703,17 @@ async function saveAnnotations(isAuto = false) {
       body: JSON.stringify({ annotations: payloadData }),
     });
     if (response.ok) {
+      if (isReviewSession()) {
+        await persistReviewSnapshot();
+      }
       item.hasLabel = true;
       updateNavigationUI();
       el.saveBtn.innerText = "✅ 已保存";
       el.saveBtn.className = "btn-primary btn-save";
       el.saveBtn.style.background = "";
+      if (el.statsModal && !el.statsModal.hidden) {
+        fetchPackageStats().catch(console.error);
+      }
     }
   } catch (error) {
     console.error(error);
@@ -1454,6 +1748,7 @@ async function fetchImagesList() {
     const response = await fetch("/api/images");
     if (response.ok) {
       const payload = await response.json();
+      resetPackageStats();
       imagesData = Array.isArray(payload.images) ? payload.images : [];
       if (imagesData.length > 0 && currentIndex === -1) {
         const savedId = localStorage.getItem("voc_last_image_id");
@@ -1537,6 +1832,13 @@ function setupEvents() {
     }
 
     switch (key) {
+      case "v":
+        if (state.review.deletedSnapshots.length) {
+          state.review.showDeleted = !state.review.showDeleted;
+          flashDebugStatus(state.review.showDeleted ? "👁 原始框" : "🙈 原始框");
+          renderCanvas();
+        }
+        break;
       case "d":
         navigateImage(-1);
         break;
@@ -1558,6 +1860,7 @@ function setupEvents() {
         }
         if (state.view.scale > 1.001) resetViewport();
         hideClassPopup();
+        closeStatsModal();
         break;
       case "delete":
       case "backspace":
@@ -1586,6 +1889,17 @@ function setupEvents() {
   window.addEventListener("mouseup", onMouseUp);
 
   el.saveBtn.addEventListener("click", () => saveAnnotations(false));
+  el.statsBtn.addEventListener("click", () => {
+    openStatsModal().catch((error) => {
+      console.error(error);
+      state.packageStats.error = error.message || "加载数据包统计失败";
+      renderStatsModal();
+    });
+  });
+  el.statsCloseBtn.addEventListener("click", closeStatsModal);
+  el.statsModal.addEventListener("click", (event) => {
+    if (event.target === el.statsModal) closeStatsModal();
+  });
   el.deleteCurrentBtn.addEventListener("click", deleteCurrentImage);
   el.prevBtn.addEventListener("click", () => navigateImage(-1));
   el.nextBtn.addEventListener("click", () => navigateImage(1));

@@ -95,9 +95,7 @@ def portable_path_string(path: Path) -> str:
 
 def default_dataset_payload() -> dict:
     return {
-        "images": portable_path_string(DEFAULT_DATASET_DIR / "images"),
-        "labels": portable_path_string(DEFAULT_DATASET_DIR / "labels"),
-        "allowUnlabeled": False,
+        "selected": False,
     }
 
 
@@ -166,12 +164,14 @@ def normalize_classes(raw_classes) -> dict[str, dict[str, str]]:
     return normalized or default_project_classes()
 
 
-def current_dataset_config() -> dict:
-    raw = read_json_file(DATASET_FILE, {})
+def current_dataset_config() -> dict | None:
+    raw = read_json_file(DATASET_FILE, default_dataset_payload())
     if not isinstance(raw, dict):
-        raw = default_dataset_payload()
+        return None
+    if raw.get("selected") is False:
+        return None
 
-    if "images" in raw and "labels" in raw:
+    if raw.get("images") and "labels" in raw:
         images = resolve_dataset_path(str(raw.get("images", "")))
         labels = resolve_dataset_path(str(raw.get("labels", "")))
         return {
@@ -181,36 +181,45 @@ def current_dataset_config() -> dict:
             "allowUnlabeled": bool(raw.get("allowUnlabeled", False)),
         }
 
-    root = resolve_dataset_path(str(raw.get("path", DEFAULT_DATASET_DIR)))
-    return {
-        "mode": "root",
-        "path": str(root),
-    }
+    if raw.get("path"):
+        root = resolve_dataset_path(str(raw.get("path", DEFAULT_DATASET_DIR)))
+        return {
+            "mode": "root",
+            "path": str(root),
+        }
+    return None
+
+
+def require_dataset_config() -> dict:
+    config = current_dataset_config()
+    if config is None:
+        raise ValueError("当前还没有激活数据包，请先在项目面板中打开一个数据包")
+    return config
 
 
 def dataset_root() -> Path:
-    config = current_dataset_config()
+    config = require_dataset_config()
     if config["mode"] == "root":
         return Path(config["path"])
     return label_dir().parent
 
 
 def image_dir() -> Path:
-    config = current_dataset_config()
+    config = require_dataset_config()
     if config["mode"] == "split":
         return Path(config["images"])
     return Path(config["path"]) / "images"
 
 
 def label_dir() -> Path:
-    config = current_dataset_config()
+    config = require_dataset_config()
     if config["mode"] == "split":
         return Path(config["labels"])
     return Path(config["path"]) / "labels"
 
 
 def class_file() -> Path:
-    config = current_dataset_config()
+    config = require_dataset_config()
     if config["mode"] == "split":
         return label_dir().parent / "classes.json"
     return Path(config["path"]) / "classes.json"
@@ -260,7 +269,10 @@ def summarize_dataset_paths(images: Path, labels: Path, mode: str = "split", roo
 
 
 def image_files() -> list[Path]:
-    images = image_dir()
+    try:
+        images = image_dir()
+    except ValueError:
+        return []
     if not images.exists():
         return []
     return sorted(p for p in images.iterdir() if p.suffix.lower() in IMAGE_EXTS and p.is_file())
@@ -336,7 +348,7 @@ def validate_dataset(path: Path) -> dict:
 
 def set_dataset(path: Path) -> dict:
     summary = validate_dataset(path)
-    write_json_file(DATASET_FILE, {"path": portable_path_string(path), "allowUnlabeled": False})
+    write_json_file(DATASET_FILE, {"selected": True, "path": portable_path_string(path), "allowUnlabeled": False})
     return summary
 
 
@@ -345,6 +357,7 @@ def set_dataset_paths(images: Path, labels: Path) -> dict:
     write_json_file(
         DATASET_FILE,
         {
+            "selected": True,
             "images": portable_path_string(images),
             "labels": portable_path_string(labels),
             "allowUnlabeled": False,
@@ -358,6 +371,7 @@ def set_dataset_paths_unchecked(images: Path, labels: Path) -> dict:
     write_json_file(
         DATASET_FILE,
         {
+            "selected": True,
             "images": portable_path_string(images),
             "labels": portable_path_string(labels),
             "allowUnlabeled": True,
@@ -367,10 +381,110 @@ def set_dataset_paths_unchecked(images: Path, labels: Path) -> dict:
 
 
 def validate_current_dataset() -> dict:
-    config = current_dataset_config()
+    config = require_dataset_config()
     if config["mode"] == "root":
         return validate_dataset(Path(config["path"]))
     return summarize_dataset_paths(image_dir(), label_dir(), mode="split")
+
+
+def clear_active_dataset() -> None:
+    write_json_file(DATASET_FILE, default_dataset_payload())
+
+
+def review_snapshot_dir() -> Path:
+    return dataset_root() / "__review_snapshots__"
+
+
+def review_snapshot_file(item_id: str) -> Path:
+    return review_snapshot_dir() / f"{item_id}.json"
+
+
+def default_review_snapshot(item_id: str) -> dict:
+    return {
+        "imageId": item_id,
+        "deleted": [],
+        "added": [],
+        "updatedAt": "",
+    }
+
+
+def normalize_annotation_entries(raw_annotations) -> list[dict]:
+    if not isinstance(raw_annotations, list):
+        return []
+    normalized_annotations = []
+    for entry in raw_annotations:
+        if not isinstance(entry, dict):
+            continue
+        points = entry.get("points", [])
+        if not isinstance(points, list):
+            continue
+        normalized_points = []
+        for point in points:
+            if not isinstance(point, (list, tuple)) or len(point) != 2:
+                continue
+            normalized_points.append([float(point[0]), float(point[1])])
+        if len(normalized_points) < 3:
+            continue
+        format_name = str(entry.get("format", "seg")).strip().lower()
+        normalized_annotations.append({
+            "cls": str(entry.get("cls", "0")).strip() or "0",
+            "format": format_name if format_name in {"seg", "hbb", "obb"} else "seg",
+            "points": normalized_points,
+        })
+    return normalized_annotations
+
+
+def read_review_snapshot(item_id: str) -> dict:
+    snapshot = read_json_file(review_snapshot_file(item_id), default_review_snapshot(item_id))
+    if not isinstance(snapshot, dict):
+        return default_review_snapshot(item_id)
+    return {
+        "imageId": item_id,
+        "deleted": normalize_annotation_entries(snapshot.get("deleted", [])),
+        "added": normalize_annotation_entries(snapshot.get("added", [])),
+        "updatedAt": str(snapshot.get("updatedAt", "")).strip(),
+    }
+
+
+def write_review_snapshot(item_id: str, deleted_annotations: list[dict], added_annotations: list[dict]) -> dict:
+    snapshot_path = review_snapshot_file(item_id)
+    deleted = normalize_annotation_entries(deleted_annotations)
+    added = normalize_annotation_entries(added_annotations)
+    if not deleted and not added:
+        if snapshot_path.exists():
+            snapshot_path.unlink()
+        return default_review_snapshot(item_id)
+
+    payload = {
+        "imageId": item_id,
+        "deleted": deleted,
+        "added": added,
+        "updatedAt": now_iso(),
+    }
+    write_json_file(snapshot_path, payload)
+    return payload
+
+
+def package_annotation_stats() -> dict:
+    require_dataset_config()
+    images = image_files()
+    counts: dict[str, int] = {}
+    total_objects = 0
+    labeled_images = 0
+    for image in images:
+        annotations = parse_label(label_path(image.stem))
+        if annotations:
+            labeled_images += 1
+        for annotation in annotations:
+            cls = str(annotation.get("cls", "")).strip()
+            counts[cls] = counts.get(cls, 0) + 1
+            total_objects += 1
+    return {
+        "imageCount": len(images),
+        "labeledImageCount": labeled_images,
+        "totalObjects": total_objects,
+        "classCounts": counts,
+    }
 
 
 def parse_label(path: Path) -> list[dict]:
@@ -682,15 +796,25 @@ class Handler(BaseHTTPRequestHandler):
             self.send_file(target, include_body=False)
             return
         if path.startswith("/data/images/"):
-            target = safe_join(image_dir(), path.removeprefix("/data/images/"))
+            try:
+                target = safe_join(image_dir(), path.removeprefix("/data/images/"))
+            except ValueError:
+                target = None
             self.send_file(target, include_body=False)
             return
         if path.startswith("/data/labels/"):
-            target = safe_join(label_dir(), path.removeprefix("/data/labels/"))
+            try:
+                target = safe_join(label_dir(), path.removeprefix("/data/labels/"))
+            except ValueError:
+                target = None
             self.send_file(target, include_body=False)
             return
         if path == "/data/classes.json":
-            self.send_file(class_file(), include_body=False)
+            try:
+                target = class_file()
+            except ValueError:
+                target = None
+            self.send_file(target, include_body=False)
             return
         if path.startswith("/api/projects/"):
             parts = [unquote(part) for part in path.split("/") if part]
@@ -756,6 +880,22 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"dataset": None, "datasetError": str(exc)}, status=200)
             return
+        if path == "/api/package-stats":
+            try:
+                self.send_json({"stats": package_annotation_stats()})
+            except Exception as exc:
+                self.send_json({"stats": None, "datasetError": str(exc)}, status=200)
+            return
+        if path.startswith("/api/review-snapshots/"):
+            item_id = unquote(path.removeprefix("/api/review-snapshots/"))
+            try:
+                if find_image(item_id) is None:
+                    self.send_error(404, "Image not found")
+                    return
+                self.send_json({"snapshot": read_review_snapshot(item_id)})
+            except Exception as exc:
+                self.send_json({"snapshot": None, "datasetError": str(exc)}, status=200)
+            return
         if path == "/api/classes":
             self.send_json({"classes": read_legacy_classes()})
             return
@@ -810,15 +950,25 @@ class Handler(BaseHTTPRequestHandler):
             self.send_file(target)
             return
         if path.startswith("/data/images/"):
-            target = safe_join(image_dir(), path.removeprefix("/data/images/"))
+            try:
+                target = safe_join(image_dir(), path.removeprefix("/data/images/"))
+            except ValueError:
+                target = None
             self.send_file(target)
             return
         if path.startswith("/data/labels/"):
-            target = safe_join(label_dir(), path.removeprefix("/data/labels/"))
+            try:
+                target = safe_join(label_dir(), path.removeprefix("/data/labels/"))
+            except ValueError:
+                target = None
             self.send_file(target)
             return
         if path == "/data/classes.json":
-            self.send_file(class_file())
+            try:
+                target = class_file()
+            except ValueError:
+                target = None
+            self.send_file(target)
             return
 
         self.send_error(404)
@@ -951,6 +1101,24 @@ class Handler(BaseHTTPRequestHandler):
                 self.update_package_status(parts[2], parts[4])
                 return
 
+        if path.startswith("/api/review-snapshots/"):
+            item_id = unquote(path.removeprefix("/api/review-snapshots/"))
+            if find_image(item_id) is None:
+                self.send_error(404, "Image not found")
+                return
+            try:
+                payload = self.read_json_body()
+                snapshot = write_review_snapshot(
+                    item_id,
+                    payload.get("deleted", []),
+                    payload.get("added", []),
+                )
+            except Exception as exc:
+                self.send_error(400, str(exc))
+                return
+            self.send_json({"ok": True, "snapshot": snapshot})
+            return
+
         if not path.startswith("/api/annotations/"):
             self.send_error(404)
             return
@@ -966,26 +1134,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(annotations, list):
                 raise ValueError("annotations must be a list")
             label_dir().mkdir(parents=True, exist_ok=True)
-            normalized_annotations = []
-            for entry in annotations:
-                if not isinstance(entry, dict):
-                    continue
-                points = entry.get("points", [])
-                if not isinstance(points, list):
-                    continue
-                normalized_points = []
-                for point in points:
-                    if not isinstance(point, (list, tuple)) or len(point) != 2:
-                        continue
-                    normalized_points.append([float(point[0]), float(point[1])])
-                if len(normalized_points) < 3:
-                    continue
-                format_name = str(entry.get("format", "seg")).strip().lower()
-                normalized_annotations.append({
-                    "cls": str(entry.get("cls", "0")).strip() or "0",
-                    "format": format_name if format_name in {"seg", "hbb", "obb"} else "seg",
-                    "points": normalized_points,
-                })
+            normalized_annotations = normalize_annotation_entries(annotations)
             label_dir().mkdir(parents=True, exist_ok=True)
             label_path(item_id).write_text(serialize_label(normalized_annotations), encoding="utf-8")
         except Exception as exc:
@@ -1421,12 +1570,11 @@ def ensure_default_files() -> None:
 
 def main() -> None:
     ensure_default_files()
+    clear_active_dataset()
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
     host = sys.argv[2] if len(sys.argv) > 2 else "0.0.0.0"
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"标注平台已启动: http://{host}:{port}")
-    print("图片目录:", image_dir())
-    print("标签目录:", label_dir())
     server.serve_forever()
 
 

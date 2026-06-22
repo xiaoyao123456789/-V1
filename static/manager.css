@@ -485,6 +485,9 @@ body.home-mode .top-strip-right {
 }
 
 .class-section {
+  position: sticky;
+  top: 24px;
+  z-index: 3;
   margin-bottom: 18px;
   padding: 14px 16px 16px;
   background: #fffdfa;
@@ -576,6 +579,13 @@ body.home-mode .top-strip-right {
   background: var(--pill-color);
   color: rgba(28, 26, 22, 0.88);
   box-shadow: inset 0 -1px 0 rgba(255, 255, 255, 0.25);
+}
+
+.class-pill-main {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
 }
 
 .class-pill-name {

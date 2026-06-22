@@ -5,7 +5,7 @@
       "name": "坑槽检测",
       "description": "",
       "createdAt": "2026-06-16T14:30:44",
-      "updatedAt": "2026-06-17T18:00:53",
+      "updatedAt": "2026-06-22T15:00:39",
       "classes": {
         "0": {
           "name": "blockpatch",
@@ -22,30 +22,30 @@
       },
       "packages": [
         {
-          "id": "pkg_2d32d81a12",
-          "name": "20260616更新包",
+          "id": "pkg_f840bfe674",
+          "name": "Yy-开发机",
           "imagesPath": "data/images",
-          "labelsPath": "data/labels",
-          "format": "seg",
-          "remark": "",
-          "status": "pending",
-          "imageCount": 11,
-          "labelCount": 11,
-          "createdAt": "2026-06-17T10:04:27",
-          "updatedAt": "2026-06-17T10:04:27"
-        },
-        {
-          "id": "pkg_a5286b75e6",
-          "name": "20260616更新包-obb",
-          "imagesPath": "data/images",
-          "labelsPath": "data/labels",
+          "labelsPath": "",
           "format": "obb",
           "remark": "",
           "status": "pending",
           "imageCount": 11,
           "labelCount": 11,
-          "createdAt": "2026-06-17T11:09:55",
-          "updatedAt": "2026-06-17T11:09:55"
+          "createdAt": "2026-06-18T16:13:08",
+          "updatedAt": "2026-06-18T16:13:08"
+        },
+        {
+          "id": "pkg_bb3397b2fb",
+          "name": "20260616更新包-开发机",
+          "imagesPath": "data/images",
+          "labelsPath": "",
+          "format": "seg",
+          "remark": "",
+          "status": "pending",
+          "imageCount": 11,
+          "labelCount": 11,
+          "createdAt": "2026-06-22T15:00:39",
+          "updatedAt": "2026-06-22T15:00:39"
         }
       ]
     }

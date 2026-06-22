@@ -1,5 +1,3 @@
 {
-  "images": "data/images",
-  "labels": "data/labels",
-  "allowUnlabeled": false
+  "selected": false
 }
