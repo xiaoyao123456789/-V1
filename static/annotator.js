@@ -1451,8 +1451,6 @@ function onCanvasDoubleClick(event) {
 
 function deleteSelection() {
   if (state.mode !== "select" || !state.selectedAnnoIndices.length) return;
-  const annotation = state.selectedAnnoIdx !== -1 ? state.annotations[state.selectedAnnoIdx] : null;
-  if (annotation?.format === "seg" && state.selectedPointIdx === -1) return;
   saveState();
   if (state.selectedAnnoIndices.length === 1 && state.selectedAnnoIdx !== -1) {
     const annotation = state.annotations[state.selectedAnnoIdx];
