@@ -528,7 +528,7 @@ select {
   transform-origin: center center;
   display: inline-block;
   background: var(--paper-panel-strong);
-  border-radius: 20px;
+  border-radius: 0;
   box-shadow: 0 20px 44px rgba(36, 24, 15, 0.18);
   overflow: hidden;
   will-change: transform;

@@ -1328,13 +1328,30 @@ function showClassPopup(clientX, clientY, annoIdx) {
     </div>
   `;
   el.classPopup.hidden = false;
+  el.classPopup.style.visibility = "hidden";
+  el.classPopup.style.left = "10px";
+  el.classPopup.style.top = "10px";
   const areaRect = el.canvasArea.getBoundingClientRect();
-  const popupWidth = 264;
-  const popupHeight = Math.min(280, 58 + entries.length * 38);
-  const left = Math.min(clientX - areaRect.left + 10, areaRect.width - popupWidth - 10);
-  const top = Math.min(clientY - areaRect.top + 10, areaRect.height - popupHeight - 10);
-  el.classPopup.style.left = `${Math.max(10, left)}px`;
-  el.classPopup.style.top = `${Math.max(10, top)}px`;
+  const popupRect = el.classPopup.getBoundingClientRect();
+  const popupWidth = Math.ceil(popupRect.width || 264);
+  const popupHeight = Math.ceil(popupRect.height || 280);
+  const minInset = 10;
+  const idealLeft = clientX - areaRect.left + 12;
+  const maxLeft = Math.max(minInset, areaRect.width - popupWidth - minInset);
+  const left = clamp(idealLeft, minInset, maxLeft);
+
+  const belowTop = clientY - areaRect.top + 12;
+  const aboveTop = clientY - areaRect.top - popupHeight - 12;
+  let top = belowTop;
+  if (belowTop + popupHeight > areaRect.height - minInset && aboveTop >= minInset) {
+    top = aboveTop;
+  }
+  const maxTop = Math.max(minInset, areaRect.height - popupHeight - minInset);
+  top = clamp(top, minInset, maxTop);
+
+  el.classPopup.style.left = `${left}px`;
+  el.classPopup.style.top = `${top}px`;
+  el.classPopup.style.visibility = "visible";
 }
 
 function hideClassPopup() {
@@ -1343,6 +1360,7 @@ function hideClassPopup() {
   }
   state.popupAnnoIdx = -1;
   el.classPopup.hidden = true;
+  el.classPopup.style.visibility = "visible";
   el.classPopup.innerHTML = "";
 }
 
@@ -1787,7 +1805,7 @@ function drawBaseAnnotation(annotation, options = {}) {
   staticCtx.lineWidth = 2;
   staticCtx.strokeStyle = color;
   staticCtx.stroke();
-  if (annotation.points.length >= 3) {
+  if (annotation.format !== "seg" && annotation.points.length >= 3) {
     staticCtx.fillStyle = `${color}20`;
     staticCtx.fill();
   }
@@ -1826,7 +1844,7 @@ function drawAnnotation(annotation, idx, preview = false) {
   ctx.stroke();
   ctx.shadowBlur = 0;
 
-  if (points.length >= 3) {
+  if (annotation.format !== "seg" && points.length >= 3) {
     ctx.fillStyle = `${color}${isPrimarySelected ? "55" : (isSelected ? "40" : (isHovered ? "35" : "20"))}`;
     ctx.fill();
   }
