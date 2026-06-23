@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path, PureWindowsPath
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 from urllib.request import Request, urlopen
 from uuid import uuid4
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -278,10 +278,121 @@ def image_files() -> list[Path]:
     return sorted(p for p in images.iterdir() if p.suffix.lower() in IMAGE_EXTS and p.is_file())
 
 
+def stem_from_name(name: str) -> str:
+    dot = name.rfind(".")
+    return name[:dot] if dot > 0 else name
+
+
+def sorted_image_entries(images: Path) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    with os.scandir(images) as iterator:
+        for entry in iterator:
+            if not entry.is_file():
+                continue
+            if Path(entry.name).suffix.lower() not in IMAGE_EXTS:
+                continue
+            entries.append((entry.name, stem_from_name(entry.name)))
+    entries.sort(key=lambda item: (item[0].lower(), item[0]))
+    return entries
+
+
+def list_label_stems(labels: Path) -> set[str]:
+    labels.mkdir(parents=True, exist_ok=True)
+    stems: set[str] = set()
+    with os.scandir(labels) as iterator:
+        for entry in iterator:
+            if not entry.is_file():
+                continue
+            if not entry.name.lower().endswith(".txt"):
+                continue
+            stems.add(stem_from_name(entry.name))
+    return stems
+
+
+def image_item_payload(filename: str, stem: str, has_label: bool) -> dict:
+    return {
+        "id": stem,
+        "filename": filename,
+        "imageUrl": f"/data/images/{quote(filename)}",
+        "labelUrl": f"/data/labels/{quote(stem)}.txt",
+        "hasLabel": has_label,
+    }
+
+
+def dataset_listing() -> tuple[list[dict], dict]:
+    config = require_dataset_config()
+    images = image_dir()
+    labels = label_dir()
+    if not images.exists() or not images.is_dir():
+        raise ValueError("图片目录不存在")
+
+    image_entries = sorted_image_entries(images)
+    if not image_entries:
+        raise ValueError("图片目录里没有可用图片")
+
+    label_stems = list_label_stems(labels)
+    image_stems = {stem for _, stem in image_entries}
+    items = [image_item_payload(name, stem, stem in label_stems) for name, stem in image_entries]
+    summary = dataset_summary(
+        images,
+        labels,
+        mode=config["mode"],
+        root_path=Path(config["path"]) if config["mode"] == "root" else None,
+    )
+    summary["imageCount"] = len(image_entries)
+    summary["labelCount"] = len(label_stems)
+    summary["missingLabelCount"] = len(image_stems - label_stems)
+    summary["extraLabelCount"] = len(label_stems - image_stems)
+    summary["hasAnyLabel"] = bool(label_stems)
+    return items, summary
+
+
+def bootstrap_image(preferred_id: str = "") -> tuple[dict | None, int]:
+    images = image_dir()
+    labels = label_dir()
+    if not images.exists() or not images.is_dir():
+        raise ValueError("图片目录不存在")
+    labels.mkdir(parents=True, exist_ok=True)
+
+    preferred = str(preferred_id).strip()
+    image_count = 0
+    first_choice: tuple[str, str] | None = None
+    preferred_choice: tuple[str, str] | None = None
+
+    with os.scandir(images) as iterator:
+        for entry in iterator:
+            if not entry.is_file():
+                continue
+            if Path(entry.name).suffix.lower() not in IMAGE_EXTS:
+                continue
+            image_count += 1
+            current = (entry.name, stem_from_name(entry.name))
+            if first_choice is None or (current[0].lower(), current[0]) < (first_choice[0].lower(), first_choice[0]):
+                first_choice = current
+            if preferred and current[1] == preferred:
+                preferred_choice = current
+
+    chosen = preferred_choice or first_choice
+    if chosen is None:
+        return None, 0
+    return image_item_payload(chosen[0], chosen[1], label_path(chosen[1]).exists()), image_count
+
+
 def find_image(item_id: str) -> Path | None:
-    for image in image_files():
-        if image.stem == item_id:
-            return image
+    try:
+        images = image_dir()
+    except ValueError:
+        return None
+    if not images.exists():
+        return None
+    with os.scandir(images) as iterator:
+        for entry in iterator:
+            if not entry.is_file():
+                continue
+            if Path(entry.name).suffix.lower() not in IMAGE_EXTS:
+                continue
+            if stem_from_name(entry.name) == item_id:
+                return Path(entry.path)
     return None
 
 
@@ -866,13 +977,20 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/annotator":
             self.send_file(STATIC_DIR / "annotator.html")
             return
-        if path == "/api/images":
-            images = self.list_images()
+        if path == "/api/images/bootstrap":
+            preferred_id = parse_qs(parsed.query).get("preferredId", [""])[0]
             try:
-                dataset = validate_current_dataset()
+                image, image_count = bootstrap_image(unquote(preferred_id) if preferred_id else "")
+                self.send_json({"image": image, "imageCount": image_count})
+            except Exception as exc:
+                self.send_json({"image": None, "imageCount": 0, "datasetError": str(exc)}, status=200)
+            return
+        if path == "/api/images":
+            try:
+                images, dataset = dataset_listing()
                 self.send_json({"images": images, "dataset": dataset})
             except Exception as exc:
-                self.send_json({"images": images, "dataset": None, "datasetError": str(exc)})
+                self.send_json({"images": [], "dataset": None, "datasetError": str(exc)})
             return
         if path == "/api/dataset":
             try:
