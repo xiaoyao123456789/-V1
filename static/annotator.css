@@ -523,9 +523,9 @@ select {
 
 .image-wrapper {
   position: absolute;
-  top: 50%;
-  left: 50%;
-  transform-origin: center center;
+  top: 0;
+  left: 0;
+  transform-origin: top left;
   display: inline-block;
   background: var(--paper-panel-strong);
   border-radius: 0;

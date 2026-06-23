@@ -63,9 +63,19 @@ const state = {
     maxScale: 4,
     offsetX: 0,
     offsetY: 0,
+    baseOffsetX: 0,
+    baseOffsetY: 0,
+    viewportWidth: 0,
+    viewportHeight: 0,
     isPanning: false,
     panLastX: 0,
     panLastY: 0,
+    rightPanActive: false,
+    rightPanMoved: false,
+    rightPanStartX: 0,
+    rightPanStartY: 0,
+    suppressContextMenuOnce: false,
+    forceFitOnNextResize: false,
   },
   render: {
     overlayQueued: false,
@@ -390,9 +400,24 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
+function fitViewportOffsets(scale = state.view.baseScale, viewportWidth = null, viewportHeight = null) {
+  const areaRect = el.canvasArea.getBoundingClientRect();
+  const widthLimit = viewportWidth ?? areaRect.width;
+  const heightLimit = viewportHeight ?? areaRect.height;
+  const width = canvas.width || imgEl.naturalWidth || imgEl.clientWidth || 0;
+  const height = canvas.height || imgEl.naturalHeight || imgEl.clientHeight || 0;
+  if (!widthLimit || !heightLimit || !width || !height) {
+    return [0, 0];
+  }
+  return [
+    (widthLimit - (width * scale)) / 2,
+    (heightLimit - (height * scale)) / 2,
+  ];
+}
+
 function updateCanvasViewport() {
   const { scale, offsetX, offsetY, isPanning } = state.view;
-  el.imageWrapper.style.transform = `translate(calc(-50% + ${offsetX}px), calc(-50% + ${offsetY}px)) scale(${scale})`;
+  el.imageWrapper.style.transform = `translate(${offsetX}px, ${offsetY}px) scale(${scale})`;
   el.canvasArea.classList.toggle("is-zoomed", scale > 1.001);
   el.canvasArea.classList.toggle("is-panning", isPanning);
   updateZoomBadge();
@@ -400,8 +425,9 @@ function updateCanvasViewport() {
 
 function resetViewport() {
   state.view.scale = state.view.baseScale;
-  state.view.offsetX = 0;
-  state.view.offsetY = 0;
+  [state.view.offsetX, state.view.offsetY] = fitViewportOffsets(state.view.baseScale);
+  state.view.baseOffsetX = state.view.offsetX;
+  state.view.baseOffsetY = state.view.offsetY;
   state.view.isPanning = false;
   updateCanvasViewport();
 }
@@ -412,17 +438,14 @@ function zoomAt(clientX, clientY, factor) {
   const next = clamp(previous * factor, state.view.minScale, state.view.maxScale);
   if (Math.abs(next - previous) < 1e-6) return;
 
-  const rect = el.imageWrapper.getBoundingClientRect();
-  const dx = clientX - (rect.left + rect.width / 2);
-  const dy = clientY - (rect.top + rect.height / 2);
-  const ratio = next / previous;
-
-  state.view.offsetX -= dx * (ratio - 1);
-  state.view.offsetY -= dy * (ratio - 1);
+  const areaRect = el.canvasArea.getBoundingClientRect();
+  const imageX = (clientX - areaRect.left - state.view.offsetX) / previous;
+  const imageY = (clientY - areaRect.top - state.view.offsetY) / previous;
   state.view.scale = next;
-  if (next <= 1.001) {
-    state.view.offsetX = 0;
-    state.view.offsetY = 0;
+  state.view.offsetX = clientX - areaRect.left - (imageX * next);
+  state.view.offsetY = clientY - areaRect.top - (imageY * next);
+  if (Math.abs(next - state.view.baseScale) < 1e-3) {
+    [state.view.offsetX, state.view.offsetY] = fitViewportOffsets(state.view.baseScale);
   }
   updateCanvasViewport();
 }
@@ -447,6 +470,28 @@ function endPan() {
   if (!state.view.isPanning) return;
   state.view.isPanning = false;
   updateCanvasViewport();
+}
+
+function beginRightPan(clientX, clientY) {
+  state.view.rightPanActive = true;
+  state.view.rightPanMoved = false;
+  state.view.rightPanStartX = clientX;
+  state.view.rightPanStartY = clientY;
+  beginPan(clientX, clientY);
+}
+
+function finishRightPan(clientX, clientY) {
+  if (!state.view.rightPanActive) return false;
+  const moved = state.view.rightPanMoved
+    || Math.hypot(clientX - state.view.rightPanStartX, clientY - state.view.rightPanStartY) > 4;
+  state.view.rightPanActive = false;
+  state.view.rightPanMoved = false;
+  state.view.rightPanStartX = 0;
+  state.view.rightPanStartY = 0;
+  if (moved) {
+    state.view.suppressContextMenuOnce = true;
+  }
+  return moved;
 }
 
 function setMode(nextMode) {
@@ -614,6 +659,7 @@ async function prepareImageSelection() {
   hideClassPopup();
   clearStaticLayer();
   renderAll();
+  state.view.forceFitOnNextResize = true;
   resetViewport();
   updateModeBadge();
   el.saveBtn.innerText = "💾 已保存";
@@ -800,13 +846,38 @@ function renderObjectList() {
 }
 
 function toggleVisibility(event, idx) {
-  event.stopPropagation();
+  event?.stopPropagation?.();
   state.annotations[idx].visible = !state.annotations[idx].visible;
   if (!state.annotations[idx].visible && selectionIncludes(idx)) {
     const next = state.selectedAnnoIndices.filter((item) => item !== idx);
     setSelection(next, next[next.length - 1] ?? null);
   }
   renderAll({ staticDirty: true });
+}
+
+function toggleSelectedVisibility() {
+  const targets = uniqueValidSelection(
+    state.selectedAnnoIndices.length ? state.selectedAnnoIndices : (state.selectedAnnoIdx !== -1 ? [state.selectedAnnoIdx] : []),
+  );
+  if (!targets.length) {
+    if (!state.mousePos) return false;
+    const hiddenIdx = findAnnotationHit(state.mousePos, { includeHidden: true, onlyHidden: true });
+    if (hiddenIdx === -1 || !state.annotations[hiddenIdx]) return false;
+    state.annotations[hiddenIdx].visible = true;
+    setSingleSelection(hiddenIdx);
+    renderAll({ staticDirty: true });
+    return true;
+  }
+  const shouldShow = targets.some((idx) => state.annotations[idx]?.visible === false);
+  targets.forEach((idx) => {
+    if (!state.annotations[idx]) return;
+    state.annotations[idx].visible = shouldShow;
+  });
+  if (!shouldShow) {
+    clearSelection();
+  }
+  renderAll({ staticDirty: true });
+  return true;
 }
 
 function deleteObject(event, idx) {
@@ -1098,11 +1169,14 @@ function closestPointOnSegment(pt, start, end) {
   };
 }
 
-function findAnnotationHit(pt) {
+function findAnnotationHit(pt, options = {}) {
+  const includeHidden = options.includeHidden === true;
+  const onlyHidden = options.onlyHidden === true;
   const edgeThreshold = 8;
   for (let i = state.annotations.length - 1; i >= 0; i -= 1) {
     const annotation = state.annotations[i];
-    if (!annotation.visible) continue;
+    if (onlyHidden && annotation.visible) continue;
+    if (!includeHidden && !annotation.visible) continue;
     if (isPointInPolygon(pt, annotation.points)) return i;
     for (let j = 0; j < annotation.points.length; j += 1) {
       const next = (j + 1) % annotation.points.length;
@@ -1371,6 +1445,7 @@ function onMouseDown(event) {
     beginPan(event.clientX, event.clientY);
     return;
   }
+  if (event.button === 2) return;
   if (event.button !== 0) return;
   const pt = getNormalizedPos(event);
   hideClassPopup();
@@ -1415,18 +1490,10 @@ function onMouseDown(event) {
       };
     }
   } else {
-    if (state.view.scale > state.view.baseScale + 0.001) {
-      beginPan(event.clientX, event.clientY);
-      return;
-    }
     state.selectedPointIdx = -1;
-    state.dragging = {
-      type: "marquee",
-      start: pt,
-      current: pt,
-      additive: event.ctrlKey || event.metaKey,
-      baseSelection: [...state.selectedAnnoIndices],
-    };
+    beginPan(event.clientX, event.clientY);
+    renderCanvas();
+    return;
   }
   renderAll(state.dragging?.type === "annotation" ? { staticDirty: true } : undefined);
 }
@@ -1658,16 +1725,32 @@ function resizeCanvas() {
   el.imageWrapper.style.width = `${canvas.width}px`;
   el.imageWrapper.style.height = `${canvas.height}px`;
   const areaRect = el.canvasArea.getBoundingClientRect();
+  const previousViewportWidth = state.view.viewportWidth || areaRect.width;
+  const previousViewportHeight = state.view.viewportHeight || areaRect.height;
   const fitWidth = (areaRect.width - 18) / naturalWidth;
   const fitHeight = (areaRect.height - 18) / naturalHeight;
   state.view.baseScale = clamp(Math.min(fitWidth, fitHeight, 1), 0.08, 1);
   state.view.minScale = Math.max(0.08, state.view.baseScale * 0.75);
   state.view.maxScale = Math.max(4, state.view.baseScale * 8);
   if (!state.view.isPanning) {
-    state.view.scale = state.view.baseScale;
-    state.view.offsetX = 0;
-    state.view.offsetY = 0;
+    if (state.view.forceFitOnNextResize || Math.abs(state.view.scale - state.view.baseScale) < 1e-3 || !state.view.scale) {
+      state.view.scale = state.view.baseScale;
+      [state.view.offsetX, state.view.offsetY] = fitViewportOffsets(state.view.baseScale);
+    } else {
+      const [previousCenterX, previousCenterY] = fitViewportOffsets(
+        state.view.scale,
+        previousViewportWidth,
+        previousViewportHeight,
+      );
+      const [nextCenterX, nextCenterY] = fitViewportOffsets(state.view.scale, areaRect.width, areaRect.height);
+      state.view.offsetX += nextCenterX - previousCenterX;
+      state.view.offsetY += nextCenterY - previousCenterY;
+    }
   }
+  state.view.forceFitOnNextResize = false;
+  [state.view.baseOffsetX, state.view.baseOffsetY] = fitViewportOffsets(state.view.baseScale);
+  state.view.viewportWidth = areaRect.width;
+  state.view.viewportHeight = areaRect.height;
   updateCanvasViewport();
   renderCanvas();
   rebuildStaticLayer();
@@ -2197,6 +2280,11 @@ function setupEvents() {
           renderCanvas();
         }
         break;
+      case "b":
+        if (toggleSelectedVisibility()) {
+          event.preventDefault();
+        }
+        break;
       case "d":
         navigateImage(-1);
         break;
@@ -2234,7 +2322,8 @@ function setupEvents() {
   canvas.addEventListener("contextmenu", onCanvasContextMenu);
   el.canvasArea.addEventListener("wheel", (event) => {
     event.preventDefault();
-    zoomAt(event.clientX, event.clientY, event.deltaY < 0 ? 1.12 : 1 / 1.12);
+    const factor = Math.exp(-event.deltaY * 0.0015);
+    zoomAt(event.clientX, event.clientY, factor);
   }, { passive: false });
   el.canvasArea.addEventListener("dblclick", onCanvasDoubleClick);
   el.canvasArea.addEventListener("contextmenu", (event) => {
