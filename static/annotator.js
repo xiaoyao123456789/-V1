@@ -16,8 +16,7 @@ let classesData = {};
 const canvas = document.getElementById("draw-canvas");
 const ctx = canvas.getContext("2d");
 const imgEl = document.getElementById("main-image");
-const OBB_ROTATE_HANDLE_OFFSET = 28;
-const OBB_ROTATE_HANDLE_RADIUS = 7;
+const OBB_ROTATE_STEP = Math.PI / 180;
 
 const state = {
   mode: "select",
@@ -573,12 +572,13 @@ async function selectImage(index) {
 function normalizeAnnotation(item) {
   if (!item || !Array.isArray(item.points)) return null;
   const format = FORMAT_ORDER.includes(item.format) ? item.format : "seg";
+  const points = item.points.map(([x, y]) => [Number(x), Number(y)]);
   return {
     cls: String(item.cls ?? "0"),
     format,
     visible: item.visible !== false,
     reviewAdded: item.reviewAdded === true,
-    points: item.points.map(([x, y]) => [Number(x), Number(y)]),
+    points,
   };
 }
 
@@ -783,10 +783,6 @@ function annotationCenter(annotation) {
   return [xs.reduce((sum, value) => sum + value, 0) / xs.length, ys.reduce((sum, value) => sum + value, 0) / ys.length];
 }
 
-function midpoint(a, b) {
-  return [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
-}
-
 function rotatePoint([x, y], angle, [cx, cy]) {
   const dx = x - cx;
   const dy = y - cy;
@@ -810,6 +806,95 @@ function polygonFromHbb(start, end) {
 
 function rotateAnnotationPoints(points, angleDelta, center) {
   return points.map((point) => rotatePoint(point, angleDelta, center));
+}
+
+function hasCanvasMetrics() {
+  return canvas.width > 0 && canvas.height > 0;
+}
+
+function imagePointToPixel([x, y]) {
+  return [x * canvas.width, y * canvas.height];
+}
+
+function pixelPointToImage([x, y]) {
+  return [x / canvas.width, y / canvas.height];
+}
+
+function pointsInsideImage(points, tolerance = 1e-6) {
+  return points.every(([x, y]) => x >= -tolerance && x <= 1 + tolerance && y >= -tolerance && y <= 1 + tolerance);
+}
+
+function obbGeometryFromPoints(points) {
+  if (!Array.isArray(points) || points.length !== 4) return null;
+  const [p0, p1, p2] = points;
+  const edgeX = p1[0] - p0[0];
+  const edgeY = p1[1] - p0[1];
+  const width = Math.hypot(edgeX, edgeY);
+  if (width < 1e-6) return null;
+
+  const angle = Math.atan2(edgeY, edgeX);
+  const ux = edgeX / width;
+  const uy = edgeY / width;
+  const normalX = -uy;
+  const normalY = ux;
+  const sideX = p2[0] - p1[0];
+  const sideY = p2[1] - p1[1];
+  const signedHeight = (sideX * normalX) + (sideY * normalY);
+  if (Math.abs(signedHeight) < 1e-6) return null;
+
+  return {
+    center: annotationCenter({ points }),
+    width,
+    height: Math.abs(signedHeight),
+    angle,
+    normalSign: signedHeight >= 0 ? 1 : -1,
+  };
+}
+
+function buildObbPoints(center, width, height, angle, normalSign = 1) {
+  const halfWidth = width / 2;
+  const halfHeight = height / 2;
+  const ux = Math.cos(angle);
+  const uy = Math.sin(angle);
+  const vx = -uy * normalSign;
+  const vy = ux * normalSign;
+  const [cx, cy] = center;
+  return [
+    [cx - (ux * halfWidth) - (vx * halfHeight), cy - (uy * halfWidth) - (vy * halfHeight)],
+    [cx + (ux * halfWidth) - (vx * halfHeight), cy + (uy * halfWidth) - (vy * halfHeight)],
+    [cx + (ux * halfWidth) + (vx * halfHeight), cy + (uy * halfWidth) + (vy * halfHeight)],
+    [cx - (ux * halfWidth) + (vx * halfHeight), cy - (uy * halfWidth) + (vy * halfHeight)],
+  ];
+}
+
+function normalizeObbPoints(points) {
+  if (!hasCanvasMetrics()) return points;
+  const pixelPoints = points.map(imagePointToPixel);
+  const geometry = obbGeometryFromPoints(pixelPoints);
+  if (!geometry) return points;
+  const normalized = buildObbPoints(
+    geometry.center,
+    geometry.width,
+    geometry.height,
+    geometry.angle,
+    geometry.normalSign,
+  ).map(pixelPointToImage);
+  return pointsInsideImage(normalized) ? normalized.map(clampPoint) : points;
+}
+
+function rotateObbPoints(points, angleDelta) {
+  if (!hasCanvasMetrics()) return null;
+  const pixelPoints = points.map(imagePointToPixel);
+  const geometry = obbGeometryFromPoints(pixelPoints);
+  if (!geometry) return null;
+  const rotated = buildObbPoints(
+    geometry.center,
+    geometry.width,
+    geometry.height,
+    geometry.angle + angleDelta,
+    geometry.normalSign,
+  ).map(pixelPointToImage);
+  return pointsInsideImage(rotated) ? rotated.map(clampPoint) : null;
 }
 
 function pixelDistance(a, b) {
@@ -841,40 +926,6 @@ function polygonFromObbEdge(start, end, sidePoint) {
     [(ex + offsetX) / canvas.width, (ey + offsetY) / canvas.height],
     [(sx + offsetX) / canvas.width, (sy + offsetY) / canvas.height],
   ];
-}
-
-function getObbHandleInfo(annotation) {
-  if (!annotation || annotation.format !== "obb" || annotation.points.length < 4) return null;
-  const center = annotationCenter(annotation);
-  const topMid = midpoint(annotation.points[0], annotation.points[1]);
-  const [cx, cy] = toPixel(center);
-  const [tx, ty] = toPixel(topMid);
-  const dx = tx - cx;
-  const dy = ty - cy;
-  const length = Math.hypot(dx, dy) || 1;
-  const handleX = tx + (dx / length) * OBB_ROTATE_HANDLE_OFFSET;
-  const handleY = ty + (dy / length) * OBB_ROTATE_HANDLE_OFFSET;
-  return {
-    center,
-    topMid,
-    handle: [handleX / canvas.width, handleY / canvas.height],
-  };
-}
-
-function findRotateHandle(pt) {
-  if (state.mode !== "select" || state.selectedAnnoIdx === -1) return null;
-  const annotation = state.annotations[state.selectedAnnoIdx];
-  const info = getObbHandleInfo(annotation);
-  if (!info) return null;
-  const [hx, hy] = toPixel(info.handle);
-  const [px, py] = toPixel(pt);
-  if (Math.hypot(px - hx, py - hy) <= OBB_ROTATE_HANDLE_RADIUS + 4) {
-    return {
-      annoIdx: state.selectedAnnoIdx,
-      center: info.center,
-    };
-  }
-  return null;
 }
 
 function findPoint(pt) {
@@ -930,6 +981,25 @@ function distanceToSegment(pt, start, end) {
   return Math.hypot(px - projX, py - projY);
 }
 
+function closestPointOnSegment(pt, start, end) {
+  const [px, py] = toPixel(pt);
+  const [x1, y1] = toPixel(start);
+  const [x2, y2] = toPixel(end);
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  if (dx === 0 && dy === 0) {
+    return { point: start, distance: Math.hypot(px - x1, py - y1), t: 0 };
+  }
+  const t = Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)));
+  const projX = x1 + t * dx;
+  const projY = y1 + t * dy;
+  return {
+    point: fromPixel(projX, projY),
+    distance: Math.hypot(px - projX, py - projY),
+    t,
+  };
+}
+
 function findAnnotationHit(pt) {
   const edgeThreshold = 8;
   for (let i = state.annotations.length - 1; i >= 0; i -= 1) {
@@ -969,6 +1039,55 @@ function normalizedRect(start, end) {
 function annotationIntersectsRect(annotation, rect) {
   const bounds = annotationBounds(annotation);
   return !(bounds.maxX < rect.minX || bounds.minX > rect.maxX || bounds.maxY < rect.minY || bounds.minY > rect.maxY);
+}
+
+function insertPointIntoSegAnnotation(annoIdx, pt) {
+  const annotation = state.annotations[annoIdx];
+  if (!annotation || annotation.format !== "seg" || annotation.points.length < 2) return false;
+
+  let bestEdge = -1;
+  let bestPoint = null;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < annotation.points.length; i += 1) {
+    const next = (i + 1) % annotation.points.length;
+    const candidate = closestPointOnSegment(pt, annotation.points[i], annotation.points[next]);
+    if (candidate.distance < bestDistance) {
+      bestDistance = candidate.distance;
+      bestEdge = i;
+      bestPoint = candidate.point;
+    }
+  }
+  if (bestEdge === -1 || !bestPoint) return false;
+
+  saveState();
+  annotation.points.splice(bestEdge + 1, 0, bestPoint.map((value) => Number(value)));
+  setSingleSelection(annoIdx);
+  state.selectedPointIdx = bestEdge + 1;
+  renderAll();
+  triggerAutoSave();
+  return true;
+}
+
+function rotateSelectedObb(angleDelta) {
+  if (state.mode !== "select") return false;
+  const targets = uniqueValidSelection(
+    state.selectedAnnoIndices.length ? state.selectedAnnoIndices : [state.selectedAnnoIdx],
+  ).filter((idx) => state.annotations[idx]?.format === "obb" && state.annotations[idx]?.points?.length === 4);
+  if (!targets.length) return false;
+
+  const rotatedEntries = targets.map((idx) => ({
+    idx,
+    points: rotateObbPoints(state.annotations[idx].points, angleDelta),
+  }));
+  if (rotatedEntries.some((entry) => !entry.points)) return false;
+
+  saveState();
+  rotatedEntries.forEach((entry) => {
+    state.annotations[entry.idx].points = entry.points;
+  });
+  renderAll();
+  triggerAutoSave();
+  return true;
 }
 
 function updateDraftShape(pt) {
@@ -1022,14 +1141,26 @@ function beginDraw(pt) {
   renderCanvas();
 }
 
+function undoDraftPoint() {
+  if (state.mode !== "draw" || state.drawFormat !== "seg" || !state.draft.points.length) return false;
+  state.draft.points.pop();
+  if (!state.draft.points.length) {
+    state.draft = { format: state.drawFormat, points: [] };
+    state.mousePos = null;
+  }
+  renderCanvas();
+  return true;
+}
+
 function finishBoxDraw() {
   if (state.draft.points.length < 4) return;
+  const points = state.draft.points.map(([x, y]) => [x, y]);
   const annotation = {
     cls: el.classSelect.value,
     format: state.draft.format,
     visible: true,
     reviewAdded: isReviewSession(),
-    points: state.draft.points.map(([x, y]) => [x, y]),
+    points: state.draft.format === "obb" ? normalizeObbPoints(points) : points,
   };
   state.annotations.push(annotation);
   setSingleSelection(state.annotations.length - 1);
@@ -1133,21 +1264,6 @@ function onMouseDown(event) {
     return;
   }
 
-  const rotateHit = findRotateHandle(pt);
-  if (rotateHit) {
-    saveState();
-    const startAngle = Math.atan2(pt[1] - rotateHit.center[1], pt[0] - rotateHit.center[0]);
-    state.dragging = {
-      type: "rotate-obb",
-      annoIdx: rotateHit.annoIdx,
-      center: rotateHit.center,
-      startAngle,
-      originalPoints: state.annotations[rotateHit.annoIdx].points.map(([x, y]) => [x, y]),
-    };
-    canvas.style.cursor = "grabbing";
-    return;
-  }
-
   const pointHit = findPoint(pt);
   if (pointHit) {
     saveState();
@@ -1164,20 +1280,24 @@ function onMouseDown(event) {
 
   const annoIdx = findAnnotationHit(pt);
   if (annoIdx !== -1) {
+    const annotation = state.annotations[annoIdx];
     if (event.ctrlKey || event.metaKey) {
       toggleSelection(annoIdx);
       state.selectedPointIdx = -1;
       renderAll();
       return;
     }
-    saveState();
     setSingleSelection(annoIdx);
-    state.dragging = {
-      type: "annotation",
-      annoIdx,
-      start: pt,
-      originalPoints: state.annotations[annoIdx].points.map(([x, y]) => [x, y]),
-    };
+    state.selectedPointIdx = -1;
+    if (annotation?.format !== "seg") {
+      saveState();
+      state.dragging = {
+        type: "annotation",
+        annoIdx,
+        start: pt,
+        originalPoints: state.annotations[annoIdx].points.map(([x, y]) => [x, y]),
+      };
+    }
   } else {
     if (state.view.scale > state.view.baseScale + 0.001) {
       beginPan(event.clientX, event.clientY);
@@ -1243,29 +1363,15 @@ function onMouseMove(event) {
     return;
   }
 
-  if (state.dragging?.type === "rotate-obb") {
-    const target = state.annotations[state.dragging.annoIdx];
-    if (!target) return;
-    const nextAngle = Math.atan2(pt[1] - state.dragging.center[1], pt[0] - state.dragging.center[0]);
-    const angleDelta = nextAngle - state.dragging.startAngle;
-    const rotated = rotateAnnotationPoints(state.dragging.originalPoints, angleDelta, state.dragging.center);
-    if (arePointsInside(rotated)) {
-      target.points = rotated;
-    }
-    renderCanvas();
-    return;
-  }
-
-  if (findRotateHandle(pt)) {
-    canvas.style.cursor = "grab";
-    return;
-  }
-
   canvas.style.cursor = findPoint(pt) ? "grab" : (findAnnotationHit(pt) !== -1 ? "pointer" : "default");
 }
 
 function onCanvasContextMenu(event) {
   event.preventDefault();
+  if (state.mode === "draw" && state.drawFormat === "seg") {
+    finishSegDraw();
+    return;
+  }
   debugLog("contextmenu", {
     target: event.target?.tagName,
     mode: state.mode,
@@ -1300,12 +1406,6 @@ function onMouseUp(event) {
     return;
   }
 
-  if (state.dragging?.type === "rotate-obb") {
-    state.dragging = null;
-    triggerAutoSave();
-    return;
-  }
-
   if (state.dragging?.type === "annotation") {
     state.dragging = null;
     triggerAutoSave();
@@ -1332,8 +1432,27 @@ function onMouseUp(event) {
   }
 }
 
+function onCanvasDoubleClick(event) {
+  if (state.mode !== "select") {
+    resetViewport();
+    return;
+  }
+  const pt = getNormalizedPos(event);
+  const annoIdx = findAnnotationHit(pt);
+  if (annoIdx === -1) {
+    resetViewport();
+    return;
+  }
+  const annotation = state.annotations[annoIdx];
+  if (annotation?.format !== "seg") return;
+  event.preventDefault();
+  insertPointIntoSegAnnotation(annoIdx, pt);
+}
+
 function deleteSelection() {
   if (state.mode !== "select" || !state.selectedAnnoIndices.length) return;
+  const annotation = state.selectedAnnoIdx !== -1 ? state.annotations[state.selectedAnnoIdx] : null;
+  if (annotation?.format === "seg" && state.selectedPointIdx === -1) return;
   saveState();
   if (state.selectedAnnoIndices.length === 1 && state.selectedAnnoIdx !== -1) {
     const annotation = state.annotations[state.selectedAnnoIdx];
@@ -1524,6 +1643,38 @@ function drawReviewAddedHalo(annotation) {
   ctx.restore();
 }
 
+function drawSegDraft() {
+  const points = state.mousePos ? [...state.draft.points, state.mousePos] : state.draft.points;
+  if (!points.length) return;
+  const color = colorFor(el.classSelect.value);
+  ctx.save();
+  const start = toPixel(points[0]);
+  ctx.beginPath();
+  ctx.moveTo(start[0], start[1]);
+  for (let i = 1; i < points.length; i += 1) {
+    const [x, y] = toPixel(points[i]);
+    ctx.lineTo(x, y);
+  }
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = color;
+  ctx.setLineDash([6, 5]);
+  ctx.stroke();
+  ctx.restore();
+
+  state.draft.points.forEach((pt, pointIdx) => drawPoint(pt, pointIdx === state.draft.points.length - 1 ? "yellow" : "white"));
+  if (state.draft.points.length >= 3) {
+    const first = toPixel(state.draft.points[0]);
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(first[0], first[1], 9, 0, Math.PI * 2);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([3, 3]);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
 function drawAnnotation(annotation, idx, preview = false) {
   const color = colorFor(annotation.cls || el.classSelect.value);
   const isPrimarySelected = !preview && idx === state.selectedAnnoIdx;
@@ -1565,27 +1716,6 @@ function drawAnnotation(annotation, idx, preview = false) {
     annotation.points.forEach((pt, pointIdx) => drawPoint(pt, pointIdx === state.selectedPointIdx ? "yellow" : "white"));
   }
 
-  if (isPrimarySelected && annotation.format === "obb") {
-    const info = getObbHandleInfo(annotation);
-    if (info) {
-      const [topX, topY] = toPixel(info.topMid);
-      const [handleX, handleY] = toPixel(info.handle);
-      ctx.beginPath();
-      ctx.moveTo(topX, topY);
-      ctx.lineTo(handleX, handleY);
-      ctx.lineWidth = 2;
-      ctx.strokeStyle = color;
-      ctx.stroke();
-
-      ctx.beginPath();
-      ctx.arc(handleX, handleY, OBB_ROTATE_HANDLE_RADIUS, 0, Math.PI * 2);
-      ctx.fillStyle = "#ffffff";
-      ctx.fill();
-      ctx.lineWidth = 3;
-      ctx.strokeStyle = color;
-      ctx.stroke();
-    }
-  }
 }
 
 function renderCanvas() {
@@ -1602,13 +1732,7 @@ function renderCanvas() {
 
   if (state.mode === "draw" && state.draft.points.length > 0) {
     if (state.draft.format === "seg") {
-      const preview = {
-        cls: el.classSelect.value,
-        format: "seg",
-        points: state.mousePos ? [...state.draft.points, state.mousePos] : state.draft.points,
-      };
-      drawAnnotation(preview, -1, true);
-      state.draft.points.forEach((pt) => drawPoint(pt, "white"));
+      drawSegDraft();
       return;
     }
 
@@ -1693,7 +1817,7 @@ async function saveAnnotations(isAuto = false) {
   const payloadData = state.annotations.map((annotation) => ({
     cls: annotation.cls,
     format: annotation.format,
-    points: annotation.points,
+    points: annotation.format === "obb" ? normalizeObbPoints(annotation.points) : annotation.points,
   }));
 
   try {
@@ -1819,6 +1943,7 @@ function setupEvents() {
       }
       if (key === "z") {
         event.preventDefault();
+        if (undoDraftPoint()) return;
         undo();
         return;
       }
@@ -1832,6 +1957,16 @@ function setupEvents() {
     }
 
     switch (key) {
+      case "z":
+        if (rotateSelectedObb(-OBB_ROTATE_STEP)) {
+          event.preventDefault();
+        }
+        break;
+      case "c":
+        if (rotateSelectedObb(OBB_ROTATE_STEP)) {
+          event.preventDefault();
+        }
+        break;
       case "v":
         if (state.review.deletedSnapshots.length) {
           state.review.showDeleted = !state.review.showDeleted;
@@ -1863,8 +1998,10 @@ function setupEvents() {
         closeStatsModal();
         break;
       case "delete":
-      case "backspace":
         deleteSelection();
+        break;
+      case "backspace":
+        event.preventDefault();
         break;
       default:
         break;
@@ -1876,10 +2013,7 @@ function setupEvents() {
     event.preventDefault();
     zoomAt(event.clientX, event.clientY, event.deltaY < 0 ? 1.12 : 1 / 1.12);
   }, { passive: false });
-  el.canvasArea.addEventListener("dblclick", (event) => {
-    event.preventDefault();
-    resetViewport();
-  });
+  el.canvasArea.addEventListener("dblclick", onCanvasDoubleClick);
   el.canvasArea.addEventListener("contextmenu", (event) => {
     if (event.target === canvas || event.target === el.classPopup) return;
     onCanvasContextMenu(event);
