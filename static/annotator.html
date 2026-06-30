@@ -34,7 +34,16 @@
 
   <div class="main-container">
     <div class="canvas-area" id="canvas-container">
-      <span class="empty-text" id="empty-text">暂无可标注图片，请先激活数据包或导入图片目录</span>
+      <div class="empty-state" id="empty-state" data-state="loading">
+        <div class="empty-state-card">
+          <span class="empty-state-kicker" id="empty-state-kicker">正在进入数据包</span>
+          <h3 class="empty-state-title" id="empty-state-title">正在读取图片...</h3>
+          <p class="empty-state-desc" id="empty-state-desc">先把首张图片打开，剩余图片列表会在后台继续补齐。</p>
+          <div class="empty-state-progress" id="empty-state-progress" aria-hidden="true">
+            <span class="empty-state-progress-bar"></span>
+          </div>
+        </div>
+      </div>
       <div class="image-wrapper" id="image-wrapper" hidden>
         <img id="main-image" src="" alt="">
         <canvas id="draw-canvas"></canvas>
@@ -57,8 +66,9 @@
           提示: 增删改及拖拽点后会自动保存。<br>
           <b>N</b>: 开始绘制 / 完成 SEG | 右键完成 SEG | <b>Ctrl+Z</b>: 撤回上个点<br>
           OBB: 第一下定起点，第二下定方向，第三下向左/右补宽成框，<b>Z/C</b> 微调旋转<br>
-          <b>V</b>: 显示/隐藏被审核删掉的原始框<br>
-          空白处拖拽: 框选 | SEG 点选中后 <b>Del</b> 删除点，框选中后 <b>Del</b> 删除框
+          <b>V</b>: 显示/隐藏被审核删掉的原始框 | <b>B</b>: 显示/隐藏选中框<br>
+          左键空白处拖动图片，右键轻点打开类别菜单<br>
+          SEG 点选中后 <b>Del</b> 删除点，框选中后 <b>Del</b> 删除框
         </div>
       </div>
     </div>
@@ -95,6 +105,6 @@
     </div>
   </div>
 
-  <script src="/static/annotator.js?v=20260623d"></script>
+  <script src="/static/annotator.js?v=20260623k"></script>
 </body>
 </html>

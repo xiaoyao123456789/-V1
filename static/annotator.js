@@ -17,6 +17,8 @@ const canvas = document.getElementById("draw-canvas");
 const ctx = canvas.getContext("2d");
 const imgEl = document.getElementById("main-image");
 const OBB_ROTATE_STEP = Math.PI / 180;
+const STATIC_RENDER_BATCH = 160;
+const STATIC_LABEL_LIMIT = 220;
 
 const state = {
   mode: "select",
@@ -50,6 +52,10 @@ const state = {
   historyStack: [],
   autoSaveTimer: null,
   popupAnnoIdx: -1,
+  catalog: {
+    loading: false,
+    bootstrapId: "",
+  },
   view: {
     scale: 1,
     baseScale: 1,
@@ -57,9 +63,24 @@ const state = {
     maxScale: 4,
     offsetX: 0,
     offsetY: 0,
+    baseOffsetX: 0,
+    baseOffsetY: 0,
+    viewportWidth: 0,
+    viewportHeight: 0,
     isPanning: false,
     panLastX: 0,
     panLastY: 0,
+    rightPanActive: false,
+    rightPanMoved: false,
+    rightPanStartX: 0,
+    rightPanStartY: 0,
+    suppressContextMenuOnce: false,
+    forceFitOnNextResize: false,
+  },
+  render: {
+    overlayQueued: false,
+    staticToken: 0,
+    staticBuilding: false,
   },
 };
 
@@ -80,7 +101,11 @@ const el = {
   imageCounter: document.getElementById("image-counter"),
   currentImageName: document.getElementById("current-image-name"),
   imageStatusBadge: document.getElementById("image-status-badge"),
-  emptyText: document.getElementById("empty-text"),
+  emptyState: document.getElementById("empty-state"),
+  emptyStateKicker: document.getElementById("empty-state-kicker"),
+  emptyStateTitle: document.getElementById("empty-state-title"),
+  emptyStateDesc: document.getElementById("empty-state-desc"),
+  emptyStateProgress: document.getElementById("empty-state-progress"),
   imageWrapper: document.getElementById("image-wrapper"),
   canvasArea: document.getElementById("canvas-container"),
   objectCount: document.getElementById("object-count"),
@@ -88,6 +113,16 @@ const el = {
   classSelect: document.getElementById("class-select"),
   classPopup: document.getElementById("class-popup"),
 };
+
+const staticCanvas = document.createElement("canvas");
+staticCanvas.id = "annotation-static-canvas";
+staticCanvas.setAttribute("aria-hidden", "true");
+staticCanvas.style.position = "absolute";
+staticCanvas.style.top = "0";
+staticCanvas.style.left = "0";
+staticCanvas.style.pointerEvents = "none";
+const staticCtx = staticCanvas.getContext("2d");
+el.imageWrapper.insertBefore(staticCanvas, canvas);
 
 const MULTI_CLASS_PLACEHOLDER = "__multi__";
 
@@ -189,7 +224,7 @@ function undo() {
   clearSelection();
   state.dragging = null;
   hideClassPopup();
-  renderAll();
+  renderAll({ staticDirty: true });
   triggerAutoSave();
 }
 
@@ -274,6 +309,19 @@ function resetPackageStats() {
   };
 }
 
+function dynamicDragIndexSet() {
+  if (state.dragging?.type === "annotation" || state.dragging?.type === "point") {
+    return new Set([state.dragging.annoIdx]);
+  }
+  return new Set();
+}
+
+function clearStaticLayer() {
+  state.render.staticToken += 1;
+  state.render.staticBuilding = false;
+  staticCtx.clearRect(0, 0, staticCanvas.width, staticCanvas.height);
+}
+
 function renderStatsModal() {
   if (!el.statsTableBody || !el.statsTotal || !el.statsEmpty) return;
   const stats = state.packageStats || {};
@@ -352,9 +400,24 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
+function fitViewportOffsets(scale = state.view.baseScale, viewportWidth = null, viewportHeight = null) {
+  const areaRect = el.canvasArea.getBoundingClientRect();
+  const widthLimit = viewportWidth ?? areaRect.width;
+  const heightLimit = viewportHeight ?? areaRect.height;
+  const width = canvas.width || imgEl.naturalWidth || imgEl.clientWidth || 0;
+  const height = canvas.height || imgEl.naturalHeight || imgEl.clientHeight || 0;
+  if (!widthLimit || !heightLimit || !width || !height) {
+    return [0, 0];
+  }
+  return [
+    (widthLimit - (width * scale)) / 2,
+    (heightLimit - (height * scale)) / 2,
+  ];
+}
+
 function updateCanvasViewport() {
   const { scale, offsetX, offsetY, isPanning } = state.view;
-  el.imageWrapper.style.transform = `translate(calc(-50% + ${offsetX}px), calc(-50% + ${offsetY}px)) scale(${scale})`;
+  el.imageWrapper.style.transform = `translate(${offsetX}px, ${offsetY}px) scale(${scale})`;
   el.canvasArea.classList.toggle("is-zoomed", scale > 1.001);
   el.canvasArea.classList.toggle("is-panning", isPanning);
   updateZoomBadge();
@@ -362,8 +425,9 @@ function updateCanvasViewport() {
 
 function resetViewport() {
   state.view.scale = state.view.baseScale;
-  state.view.offsetX = 0;
-  state.view.offsetY = 0;
+  [state.view.offsetX, state.view.offsetY] = fitViewportOffsets(state.view.baseScale);
+  state.view.baseOffsetX = state.view.offsetX;
+  state.view.baseOffsetY = state.view.offsetY;
   state.view.isPanning = false;
   updateCanvasViewport();
 }
@@ -374,17 +438,14 @@ function zoomAt(clientX, clientY, factor) {
   const next = clamp(previous * factor, state.view.minScale, state.view.maxScale);
   if (Math.abs(next - previous) < 1e-6) return;
 
-  const rect = el.imageWrapper.getBoundingClientRect();
-  const dx = clientX - (rect.left + rect.width / 2);
-  const dy = clientY - (rect.top + rect.height / 2);
-  const ratio = next / previous;
-
-  state.view.offsetX -= dx * (ratio - 1);
-  state.view.offsetY -= dy * (ratio - 1);
+  const areaRect = el.canvasArea.getBoundingClientRect();
+  const imageX = (clientX - areaRect.left - state.view.offsetX) / previous;
+  const imageY = (clientY - areaRect.top - state.view.offsetY) / previous;
   state.view.scale = next;
-  if (next <= 1.001) {
-    state.view.offsetX = 0;
-    state.view.offsetY = 0;
+  state.view.offsetX = clientX - areaRect.left - (imageX * next);
+  state.view.offsetY = clientY - areaRect.top - (imageY * next);
+  if (Math.abs(next - state.view.baseScale) < 1e-3) {
+    [state.view.offsetX, state.view.offsetY] = fitViewportOffsets(state.view.baseScale);
   }
   updateCanvasViewport();
 }
@@ -409,6 +470,28 @@ function endPan() {
   if (!state.view.isPanning) return;
   state.view.isPanning = false;
   updateCanvasViewport();
+}
+
+function beginRightPan(clientX, clientY) {
+  state.view.rightPanActive = true;
+  state.view.rightPanMoved = false;
+  state.view.rightPanStartX = clientX;
+  state.view.rightPanStartY = clientY;
+  beginPan(clientX, clientY);
+}
+
+function finishRightPan(clientX, clientY) {
+  if (!state.view.rightPanActive) return false;
+  const moved = state.view.rightPanMoved
+    || Math.hypot(clientX - state.view.rightPanStartX, clientY - state.view.rightPanStartY) > 4;
+  state.view.rightPanActive = false;
+  state.view.rightPanMoved = false;
+  state.view.rightPanStartX = 0;
+  state.view.rightPanStartY = 0;
+  if (moved) {
+    state.view.suppressContextMenuOnce = true;
+  }
+  return moved;
 }
 
 function setMode(nextMode) {
@@ -465,9 +548,48 @@ async function activatePackageFromQuery() {
 }
 
 function updateEmptyState(message) {
-  el.emptyText.textContent = message || "暂无可标注图片，请先激活数据包或导入图片目录";
-  el.emptyText.style.display = "block";
+  showEmptyState({
+    mode: "empty",
+    kicker: "暂无图片",
+    title: "这个数据包里还没有可标注图片",
+    description: message || "请先确认图片目录是否已导入，或回到项目页重新打开数据包。",
+  });
   el.imageWrapper.hidden = true;
+  clearStaticLayer();
+  renderCanvas();
+}
+
+function showEmptyState({ mode = "loading", kicker = "", title = "", description = "" }) {
+  el.emptyState.dataset.state = mode;
+  el.emptyState.hidden = false;
+  el.emptyStateKicker.textContent = kicker;
+  el.emptyStateTitle.textContent = title;
+  el.emptyStateDesc.textContent = description;
+}
+
+function setLoadingState(title, description = "先把首张图片打开，剩余图片列表会在后台继续补齐。") {
+  showEmptyState({
+    mode: "loading",
+    kicker: "正在载入",
+    title: title || "正在读取图片...",
+    description,
+  });
+}
+
+function showErrorState(message, title = "打开数据包失败") {
+  showEmptyState({
+    mode: "error",
+    kicker: "加载失败",
+    title,
+    description: message || "请检查数据包路径和服务状态后重试。",
+  });
+  el.imageWrapper.hidden = true;
+  clearStaticLayer();
+  renderCanvas();
+}
+
+function hideEmptyState() {
+  el.emptyState.hidden = true;
 }
 
 function updateNavigationUI() {
@@ -481,10 +603,12 @@ function updateNavigationUI() {
   }
 
   el.prevBtn.disabled = currentIndex === 0;
-  el.nextBtn.disabled = currentIndex === imagesData.length - 1;
+  el.nextBtn.disabled = state.catalog.loading || currentIndex === imagesData.length - 1;
 
   const currentImg = imagesData[currentIndex];
-  el.imageCounter.innerText = `${currentIndex + 1} / ${imagesData.length}`;
+  el.imageCounter.innerText = state.catalog.loading
+    ? `${currentIndex + 1} / ...`
+    : `${currentIndex + 1} / ${imagesData.length}`;
   el.currentImageName.innerText = currentImg.filename;
   el.imageStatusBadge.innerHTML = currentImg.hasLabel
     ? `<span class="status-badge status-labeled">已标</span>`
@@ -500,7 +624,7 @@ function navigateImage(direction) {
 }
 
 function jumpToImage() {
-  if (imagesData.length === 0) return;
+  if (imagesData.length === 0 || state.catalog.loading) return;
   const input = prompt(`请输入要跳转的页码 (1 - ${imagesData.length})：\n当前在第 ${currentIndex + 1} 页`, currentIndex + 1);
   if (!input) return;
 
@@ -512,9 +636,7 @@ function jumpToImage() {
   }
 }
 
-async function selectImage(index) {
-  if (index < 0 || index >= imagesData.length) return;
-
+async function prepareImageSelection() {
   if (state.autoSaveTimer) {
     clearTimeout(state.autoSaveTimer);
     state.autoSaveTimer = null;
@@ -535,18 +657,34 @@ async function selectImage(index) {
   state.dragging = null;
   state.popupAnnoIdx = -1;
   hideClassPopup();
+  clearStaticLayer();
+  renderAll();
+  state.view.forceFitOnNextResize = true;
   resetViewport();
   updateModeBadge();
   el.saveBtn.innerText = "💾 已保存";
   el.saveBtn.className = "btn-primary btn-save";
   el.saveBtn.style.background = "";
+}
 
+function normalizeImageItem(item) {
+  if (!item || !item.id || !item.filename || !item.imageUrl) return null;
+  return {
+    id: String(item.id),
+    filename: String(item.filename),
+    imageUrl: String(item.imageUrl),
+    labelUrl: String(item.labelUrl || `/data/labels/${encodeURIComponent(item.id)}.txt`),
+    hasLabel: item.hasLabel === true,
+  };
+}
+
+async function loadImageRecord(img, index) {
+  if (!img) return;
+  await prepareImageSelection();
   currentIndex = index;
-  const img = currentItem();
   localStorage.setItem("voc_last_image_id", img.id);
 
   updateNavigationUI();
-  el.emptyText.style.display = "none";
   canvas.style.cursor = "default";
   imgEl.src = img.imageUrl;
 
@@ -566,7 +704,13 @@ async function selectImage(index) {
     console.error(error);
   }
   if (currentItem()?.id !== img.id) return;
-  renderAll();
+  renderAll({ staticDirty: true });
+}
+
+async function selectImage(index) {
+  if (index < 0 || index >= imagesData.length) return;
+  const img = imagesData[index];
+  await loadImageRecord(img, index);
 }
 
 function normalizeAnnotation(item) {
@@ -702,13 +846,38 @@ function renderObjectList() {
 }
 
 function toggleVisibility(event, idx) {
-  event.stopPropagation();
+  event?.stopPropagation?.();
   state.annotations[idx].visible = !state.annotations[idx].visible;
   if (!state.annotations[idx].visible && selectionIncludes(idx)) {
     const next = state.selectedAnnoIndices.filter((item) => item !== idx);
     setSelection(next, next[next.length - 1] ?? null);
   }
-  renderAll();
+  renderAll({ staticDirty: true });
+}
+
+function toggleSelectedVisibility() {
+  const targets = uniqueValidSelection(
+    state.selectedAnnoIndices.length ? state.selectedAnnoIndices : (state.selectedAnnoIdx !== -1 ? [state.selectedAnnoIdx] : []),
+  );
+  if (!targets.length) {
+    if (!state.mousePos) return false;
+    const hiddenIdx = findAnnotationHit(state.mousePos, { includeHidden: true, onlyHidden: true });
+    if (hiddenIdx === -1 || !state.annotations[hiddenIdx]) return false;
+    state.annotations[hiddenIdx].visible = true;
+    setSingleSelection(hiddenIdx);
+    renderAll({ staticDirty: true });
+    return true;
+  }
+  const shouldShow = targets.some((idx) => state.annotations[idx]?.visible === false);
+  targets.forEach((idx) => {
+    if (!state.annotations[idx]) return;
+    state.annotations[idx].visible = shouldShow;
+  });
+  if (!shouldShow) {
+    clearSelection();
+  }
+  renderAll({ staticDirty: true });
+  return true;
 }
 
 function deleteObject(event, idx) {
@@ -724,7 +893,7 @@ function deleteObject(event, idx) {
   setSelection(nextSelection, state.selectedAnnoIdx > idx ? state.selectedAnnoIdx - 1 : state.selectedAnnoIdx);
   if (state.hoveredAnnoIdx === idx) state.hoveredAnnoIdx = -1;
   hideClassPopup();
-  renderAll();
+  renderAll({ staticDirty: true });
   triggerAutoSave();
 }
 
@@ -1000,11 +1169,14 @@ function closestPointOnSegment(pt, start, end) {
   };
 }
 
-function findAnnotationHit(pt) {
+function findAnnotationHit(pt, options = {}) {
+  const includeHidden = options.includeHidden === true;
+  const onlyHidden = options.onlyHidden === true;
   const edgeThreshold = 8;
   for (let i = state.annotations.length - 1; i >= 0; i -= 1) {
     const annotation = state.annotations[i];
-    if (!annotation.visible) continue;
+    if (onlyHidden && annotation.visible) continue;
+    if (!includeHidden && !annotation.visible) continue;
     if (isPointInPolygon(pt, annotation.points)) return i;
     for (let j = 0; j < annotation.points.length; j += 1) {
       const next = (j + 1) % annotation.points.length;
@@ -1063,7 +1235,7 @@ function insertPointIntoSegAnnotation(annoIdx, pt) {
   annotation.points.splice(bestEdge + 1, 0, bestPoint.map((value) => Number(value)));
   setSingleSelection(annoIdx);
   state.selectedPointIdx = bestEdge + 1;
-  renderAll();
+  renderAll({ staticDirty: true });
   triggerAutoSave();
   return true;
 }
@@ -1085,7 +1257,7 @@ function rotateSelectedObb(angleDelta) {
   rotatedEntries.forEach((entry) => {
     state.annotations[entry.idx].points = entry.points;
   });
-  renderAll();
+  renderAll({ staticDirty: true });
   triggerAutoSave();
   return true;
 }
@@ -1168,7 +1340,7 @@ function finishBoxDraw() {
   state.draft = { format: state.drawFormat, points: [] };
   state.mode = "select";
   updateModeBadge();
-  renderAll();
+  renderAll({ staticDirty: true });
   triggerAutoSave();
 }
 
@@ -1185,7 +1357,7 @@ function finishSegDraw() {
   state.draft = { format: state.drawFormat, points: [] };
   state.mode = "select";
   updateModeBadge();
-  renderAll();
+  renderAll({ staticDirty: true });
   triggerAutoSave();
 }
 
@@ -1230,13 +1402,30 @@ function showClassPopup(clientX, clientY, annoIdx) {
     </div>
   `;
   el.classPopup.hidden = false;
+  el.classPopup.style.visibility = "hidden";
+  el.classPopup.style.left = "10px";
+  el.classPopup.style.top = "10px";
   const areaRect = el.canvasArea.getBoundingClientRect();
-  const popupWidth = 264;
-  const popupHeight = Math.min(280, 58 + entries.length * 38);
-  const left = Math.min(clientX - areaRect.left + 10, areaRect.width - popupWidth - 10);
-  const top = Math.min(clientY - areaRect.top + 10, areaRect.height - popupHeight - 10);
-  el.classPopup.style.left = `${Math.max(10, left)}px`;
-  el.classPopup.style.top = `${Math.max(10, top)}px`;
+  const popupRect = el.classPopup.getBoundingClientRect();
+  const popupWidth = Math.ceil(popupRect.width || 264);
+  const popupHeight = Math.ceil(popupRect.height || 280);
+  const minInset = 10;
+  const idealLeft = clientX - areaRect.left + 12;
+  const maxLeft = Math.max(minInset, areaRect.width - popupWidth - minInset);
+  const left = clamp(idealLeft, minInset, maxLeft);
+
+  const belowTop = clientY - areaRect.top + 12;
+  const aboveTop = clientY - areaRect.top - popupHeight - 12;
+  let top = belowTop;
+  if (belowTop + popupHeight > areaRect.height - minInset && aboveTop >= minInset) {
+    top = aboveTop;
+  }
+  const maxTop = Math.max(minInset, areaRect.height - popupHeight - minInset);
+  top = clamp(top, minInset, maxTop);
+
+  el.classPopup.style.left = `${left}px`;
+  el.classPopup.style.top = `${top}px`;
+  el.classPopup.style.visibility = "visible";
 }
 
 function hideClassPopup() {
@@ -1245,6 +1434,7 @@ function hideClassPopup() {
   }
   state.popupAnnoIdx = -1;
   el.classPopup.hidden = true;
+  el.classPopup.style.visibility = "visible";
   el.classPopup.innerHTML = "";
 }
 
@@ -1255,6 +1445,7 @@ function onMouseDown(event) {
     beginPan(event.clientX, event.clientY);
     return;
   }
+  if (event.button === 2) return;
   if (event.button !== 0) return;
   const pt = getNormalizedPos(event);
   hideClassPopup();
@@ -1274,7 +1465,7 @@ function onMouseDown(event) {
       annoIdx: pointHit.annoIdx,
       pointIdx: pointHit.pointIdx,
     };
-    renderAll();
+    renderAll({ staticDirty: true });
     return;
   }
 
@@ -1299,20 +1490,12 @@ function onMouseDown(event) {
       };
     }
   } else {
-    if (state.view.scale > state.view.baseScale + 0.001) {
-      beginPan(event.clientX, event.clientY);
-      return;
-    }
     state.selectedPointIdx = -1;
-    state.dragging = {
-      type: "marquee",
-      start: pt,
-      current: pt,
-      additive: event.ctrlKey || event.metaKey,
-      baseSelection: [...state.selectedAnnoIndices],
-    };
+    beginPan(event.clientX, event.clientY);
+    renderCanvas();
+    return;
   }
-  renderAll();
+  renderAll(state.dragging?.type === "annotation" ? { staticDirty: true } : undefined);
 }
 
 function onMouseMove(event) {
@@ -1408,12 +1591,14 @@ function onMouseUp(event) {
 
   if (state.dragging?.type === "annotation") {
     state.dragging = null;
+    renderAll({ staticDirty: true });
     triggerAutoSave();
     return;
   }
 
   if (state.dragging?.type === "point") {
     state.dragging = null;
+    renderAll({ staticDirty: true });
     triggerAutoSave();
     return;
   }
@@ -1474,7 +1659,7 @@ function deleteSelection() {
     clearSelection();
   }
   hideClassPopup();
-  renderAll();
+  renderAll({ staticDirty: true });
   triggerAutoSave();
 }
 
@@ -1509,7 +1694,7 @@ function applyClassToSelection(newCls, annoIndices = state.selectedAnnoIndices) 
     el.classSelect.value = newCls;
   }
   hideClassPopup();
-  renderAll();
+  renderAll({ staticDirty: true });
   triggerAutoSave();
 }
 
@@ -1533,30 +1718,49 @@ function resizeCanvas() {
   const naturalHeight = imgEl.naturalHeight || imgEl.clientHeight;
   canvas.width = naturalWidth;
   canvas.height = naturalHeight;
+  staticCanvas.width = naturalWidth;
+  staticCanvas.height = naturalHeight;
   imgEl.style.width = `${canvas.width}px`;
   imgEl.style.height = `${canvas.height}px`;
   el.imageWrapper.style.width = `${canvas.width}px`;
   el.imageWrapper.style.height = `${canvas.height}px`;
   const areaRect = el.canvasArea.getBoundingClientRect();
+  const previousViewportWidth = state.view.viewportWidth || areaRect.width;
+  const previousViewportHeight = state.view.viewportHeight || areaRect.height;
   const fitWidth = (areaRect.width - 18) / naturalWidth;
   const fitHeight = (areaRect.height - 18) / naturalHeight;
   state.view.baseScale = clamp(Math.min(fitWidth, fitHeight, 1), 0.08, 1);
   state.view.minScale = Math.max(0.08, state.view.baseScale * 0.75);
   state.view.maxScale = Math.max(4, state.view.baseScale * 8);
   if (!state.view.isPanning) {
-    state.view.scale = state.view.baseScale;
-    state.view.offsetX = 0;
-    state.view.offsetY = 0;
+    if (state.view.forceFitOnNextResize || Math.abs(state.view.scale - state.view.baseScale) < 1e-3 || !state.view.scale) {
+      state.view.scale = state.view.baseScale;
+      [state.view.offsetX, state.view.offsetY] = fitViewportOffsets(state.view.baseScale);
+    } else {
+      const [previousCenterX, previousCenterY] = fitViewportOffsets(
+        state.view.scale,
+        previousViewportWidth,
+        previousViewportHeight,
+      );
+      const [nextCenterX, nextCenterY] = fitViewportOffsets(state.view.scale, areaRect.width, areaRect.height);
+      state.view.offsetX += nextCenterX - previousCenterX;
+      state.view.offsetY += nextCenterY - previousCenterY;
+    }
   }
+  state.view.forceFitOnNextResize = false;
+  [state.view.baseOffsetX, state.view.baseOffsetY] = fitViewportOffsets(state.view.baseScale);
+  state.view.viewportWidth = areaRect.width;
+  state.view.viewportHeight = areaRect.height;
   updateCanvasViewport();
   renderCanvas();
+  rebuildStaticLayer();
 }
 
 imgEl.onload = () => {
   resetViewport();
   resizeCanvas();
   el.imageWrapper.hidden = false;
-  renderAll();
+  hideEmptyState();
 };
 
 function drawPoint(pt, fillColor) {
@@ -1570,26 +1774,26 @@ function drawPoint(pt, fillColor) {
   ctx.stroke();
 }
 
-function renderSelectionMarquee() {
+function renderSelectionMarquee(renderCtx = ctx) {
   if (state.dragging?.type !== "marquee") return;
   const rect = normalizedRect(state.dragging.start, state.dragging.current);
   const [x1, y1] = toPixel([rect.minX, rect.minY]);
   const [x2, y2] = toPixel([rect.maxX, rect.maxY]);
-  ctx.save();
-  ctx.fillStyle = "rgba(24, 144, 255, 0.12)";
-  ctx.strokeStyle = "rgba(24, 144, 255, 0.9)";
-  ctx.lineWidth = 1.5;
-  ctx.setLineDash([8, 6]);
-  ctx.fillRect(x1, y1, x2 - x1, y2 - y1);
-  ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-  ctx.restore();
+  renderCtx.save();
+  renderCtx.fillStyle = "rgba(24, 144, 255, 0.12)";
+  renderCtx.strokeStyle = "rgba(24, 144, 255, 0.9)";
+  renderCtx.lineWidth = 1.5;
+  renderCtx.setLineDash([8, 6]);
+  renderCtx.fillRect(x1, y1, x2 - x1, y2 - y1);
+  renderCtx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+  renderCtx.restore();
 }
 
-function annotationGradient(annotation) {
+function annotationGradient(annotation, renderCtx = ctx) {
   const bounds = annotationBounds(annotation);
   const [x1, y1] = toPixel([bounds.minX, bounds.minY]);
   const [x2, y2] = toPixel([bounds.maxX, bounds.maxY]);
-  const gradient = ctx.createLinearGradient(x1, y1, Math.max(x1 + 1, x2), Math.max(y1 + 1, y2));
+  const gradient = renderCtx.createLinearGradient(x1, y1, Math.max(x1 + 1, x2), Math.max(y1 + 1, y2));
   gradient.addColorStop(0, "#ff4d4f");
   gradient.addColorStop(0.2, "#fa8c16");
   gradient.addColorStop(0.4, "#fadb14");
@@ -1599,46 +1803,46 @@ function annotationGradient(annotation) {
   return gradient;
 }
 
-function traceAnnotationPath(points) {
+function traceAnnotationPath(points, renderCtx = ctx) {
   if (!points.length) return false;
   const start = toPixel(points[0]);
-  ctx.beginPath();
-  ctx.moveTo(start[0], start[1]);
+  renderCtx.beginPath();
+  renderCtx.moveTo(start[0], start[1]);
   for (let i = 1; i < points.length; i += 1) {
     const [x, y] = toPixel(points[i]);
-    ctx.lineTo(x, y);
+    renderCtx.lineTo(x, y);
   }
-  if (points.length >= 3) ctx.closePath();
+  if (points.length >= 3) renderCtx.closePath();
   return true;
 }
 
-function drawDeletedReviewAnnotation(annotation) {
+function drawDeletedReviewAnnotation(annotation, renderCtx = ctx) {
   if (!annotation?.points?.length) return;
   const color = colorFor(annotation.cls || el.classSelect.value);
-  ctx.save();
-  traceAnnotationPath(annotation.points);
-  ctx.lineWidth = 2;
-  ctx.setLineDash([10, 6]);
-  ctx.strokeStyle = color;
-  ctx.globalAlpha = 0.9;
-  ctx.stroke();
-  ctx.setLineDash([]);
+  renderCtx.save();
+  traceAnnotationPath(annotation.points, renderCtx);
+  renderCtx.lineWidth = 2;
+  renderCtx.setLineDash([10, 6]);
+  renderCtx.strokeStyle = color;
+  renderCtx.globalAlpha = 0.9;
+  renderCtx.stroke();
+  renderCtx.setLineDash([]);
   const [x, y] = toPixel(annotation.points[0]);
-  ctx.fillStyle = color;
-  ctx.font = "12px sans-serif";
-  ctx.fillText(`原:${classNameFor(annotation.cls || "")}`, x + 8, y - 8);
-  ctx.restore();
+  renderCtx.fillStyle = color;
+  renderCtx.font = "12px sans-serif";
+  renderCtx.fillText(`原:${classNameFor(annotation.cls || "")}`, x + 8, y - 8);
+  renderCtx.restore();
 }
 
-function drawReviewAddedHalo(annotation) {
+function drawReviewAddedHalo(annotation, renderCtx = ctx) {
   if (!annotation?.reviewAdded || !annotation?.points?.length) return;
-  ctx.save();
-  traceAnnotationPath(annotation.points);
-  ctx.lineWidth = 6;
-  ctx.strokeStyle = annotationGradient(annotation);
-  ctx.globalAlpha = 0.85;
-  ctx.stroke();
-  ctx.restore();
+  renderCtx.save();
+  traceAnnotationPath(annotation.points, renderCtx);
+  renderCtx.lineWidth = 6;
+  renderCtx.strokeStyle = annotationGradient(annotation, renderCtx);
+  renderCtx.globalAlpha = 0.85;
+  renderCtx.stroke();
+  renderCtx.restore();
 }
 
 function drawSegDraft() {
@@ -1673,6 +1877,28 @@ function drawSegDraft() {
   }
 }
 
+function drawBaseAnnotation(annotation, options = {}) {
+  const { showLabel = true } = options;
+  if (!annotation?.points?.length) return;
+  const color = colorFor(annotation.cls || el.classSelect.value);
+  if (annotation.reviewAdded) {
+    drawReviewAddedHalo(annotation, staticCtx);
+  }
+  traceAnnotationPath(annotation.points, staticCtx);
+  staticCtx.lineWidth = 2;
+  staticCtx.strokeStyle = color;
+  staticCtx.stroke();
+  if (annotation.format !== "seg" && annotation.points.length >= 3) {
+    staticCtx.fillStyle = `${color}20`;
+    staticCtx.fill();
+  }
+  if (!showLabel) return;
+  const start = toPixel(annotation.points[0]);
+  staticCtx.fillStyle = color;
+  staticCtx.font = "600 12px sans-serif";
+  staticCtx.fillText(classNameFor(annotation.cls || el.classSelect.value), start[0] + 6, start[1] + 14);
+}
+
 function drawAnnotation(annotation, idx, preview = false) {
   const color = colorFor(annotation.cls || el.classSelect.value);
   const isPrimarySelected = !preview && idx === state.selectedAnnoIdx;
@@ -1681,11 +1907,15 @@ function drawAnnotation(annotation, idx, preview = false) {
   const points = annotation.points;
   if (!points.length) return;
 
-  if (!preview) {
-    drawReviewAddedHalo(annotation);
+  if (!preview && !isSelected && !isHovered) {
+    return;
   }
 
-  traceAnnotationPath(points);
+  if (!preview) {
+    drawReviewAddedHalo(annotation, ctx);
+  }
+
+  traceAnnotationPath(points, ctx);
   const start = toPixel(points[0]);
 
   ctx.lineWidth = isSelected || isHovered ? 3 : 2;
@@ -1697,7 +1927,7 @@ function drawAnnotation(annotation, idx, preview = false) {
   ctx.stroke();
   ctx.shadowBlur = 0;
 
-  if (points.length >= 3) {
+  if (annotation.format !== "seg" && points.length >= 3) {
     ctx.fillStyle = `${color}${isPrimarySelected ? "55" : (isSelected ? "40" : (isHovered ? "35" : "20"))}`;
     ctx.fill();
   }
@@ -1716,11 +1946,12 @@ function drawAnnotation(annotation, idx, preview = false) {
 
 }
 
-function renderCanvas() {
+function paintOverlayCanvas() {
+  state.render.overlayQueued = false;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
   if (state.review.showDeleted) {
-    state.review.deletedSnapshots.forEach((annotation) => drawDeletedReviewAnnotation(annotation));
+    state.review.deletedSnapshots.forEach((annotation) => drawDeletedReviewAnnotation(annotation, ctx));
   }
 
   state.annotations.forEach((annotation, idx) => {
@@ -1781,10 +2012,49 @@ function renderCanvas() {
       return;
     }
   }
-  renderSelectionMarquee();
+  renderSelectionMarquee(ctx);
 }
 
-function renderAll() {
+function renderCanvas() {
+  if (state.render.overlayQueued) return;
+  state.render.overlayQueued = true;
+  requestAnimationFrame(paintOverlayCanvas);
+}
+
+function rebuildStaticLayer() {
+  const token = state.render.staticToken + 1;
+  state.render.staticToken = token;
+  state.render.staticBuilding = true;
+  staticCtx.clearRect(0, 0, staticCanvas.width, staticCanvas.height);
+
+  const hiddenSelected = dynamicDragIndexSet();
+  const visibleAnnotations = state.annotations
+    .map((annotation, idx) => ({ annotation, idx }))
+    .filter(({ annotation, idx }) => annotation.visible && !hiddenSelected.has(idx));
+  const showLabels = visibleAnnotations.length <= STATIC_LABEL_LIMIT;
+
+  let cursor = 0;
+  function drawChunk() {
+    if (state.render.staticToken !== token) return;
+    const limit = Math.min(cursor + STATIC_RENDER_BATCH, visibleAnnotations.length);
+    for (; cursor < limit; cursor += 1) {
+      drawBaseAnnotation(visibleAnnotations[cursor].annotation, { showLabel: showLabels });
+    }
+    renderCanvas();
+    if (cursor < visibleAnnotations.length) {
+      requestAnimationFrame(drawChunk);
+      return;
+    }
+    state.render.staticBuilding = false;
+  }
+
+  requestAnimationFrame(drawChunk);
+}
+
+function renderAll(options = {}) {
+  if (options.staticDirty) {
+    rebuildStaticLayer();
+  }
   renderCanvas();
   renderObjectList();
   if (el.statsModal && !el.statsModal.hidden) {
@@ -1859,10 +2129,37 @@ async function fetchClasses() {
       Object.entries(classesData).forEach(([key, value]) => {
         el.classSelect.innerHTML += `<option value="${key}">${key} (${value.name || key})</option>`;
       });
+      if (currentIndex !== -1) {
+        renderAll({ staticDirty: true });
+      }
     }
   } catch (error) {
     console.error(error);
   }
+}
+
+async function bootstrapAnnotator() {
+  const preferredId = localStorage.getItem("voc_last_image_id") || "";
+  const query = preferredId ? `?preferredId=${encodeURIComponent(preferredId)}` : "";
+  setLoadingState("正在读取首张图片...", "会优先打开你上次停留的图片，剩余列表随后在后台继续补齐。");
+
+  const response = await fetch(`/api/images/bootstrap${query}`);
+  const payload = await response.json();
+  const firstImage = normalizeImageItem(payload.image);
+  if (!response.ok || !firstImage) {
+    throw new Error(payload.datasetError || "当前数据包里没有可用图片");
+  }
+
+  resetPackageStats();
+  state.catalog.loading = true;
+  state.catalog.bootstrapId = firstImage.id;
+  imagesData = [firstImage];
+  await loadImageRecord(firstImage, 0);
+  fetchImagesList().catch((error) => {
+    console.error(error);
+    state.catalog.loading = false;
+    updateNavigationUI();
+  });
 }
 
 async function fetchImagesList() {
@@ -1871,29 +2168,38 @@ async function fetchImagesList() {
     if (response.ok) {
       const payload = await response.json();
       resetPackageStats();
-      imagesData = Array.isArray(payload.images) ? payload.images : [];
-      if (imagesData.length > 0 && currentIndex === -1) {
-        const savedId = localStorage.getItem("voc_last_image_id");
-        let startIdx = 0;
-        if (savedId) {
-          const foundIdx = imagesData.findIndex((img) => img.id === savedId);
-          if (foundIdx !== -1) startIdx = foundIdx;
-        }
-        selectImage(startIdx);
-      } else {
-        if (!imagesData.length) {
-          updateEmptyState(payload.datasetError || "暂无可标注图片，请先激活数据包或导入图片目录");
-        }
+      const activeId = currentItem()?.id || state.catalog.bootstrapId || localStorage.getItem("voc_last_image_id") || "";
+      const nextImages = Array.isArray(payload.images) ? payload.images.map(normalizeImageItem).filter(Boolean) : [];
+      imagesData = nextImages;
+      state.catalog.loading = false;
+      if (!imagesData.length) {
+        updateEmptyState(payload.datasetError || "这个数据包里还没有可标注图片");
         updateNavigationUI();
+        return;
       }
+      const resolvedIndex = Math.max(0, imagesData.findIndex((img) => img.id === activeId));
+      currentIndex = resolvedIndex;
+      state.catalog.bootstrapId = "";
+      updateNavigationUI();
+      return;
     }
+    throw new Error("图片列表加载失败");
   } catch (error) {
     console.error(error);
-    updateEmptyState("图片列表加载失败，请检查程序目录和数据路径");
+    state.catalog.loading = false;
+    if (!currentItem()) {
+      showErrorState("图片列表加载失败，请检查程序目录和数据路径", "读取图片列表失败");
+    } else {
+      updateNavigationUI();
+    }
   }
 }
 
 async function deleteCurrentImage() {
+  if (state.catalog.loading) {
+    alert("图片列表还在读取中，请稍等一下再删图。");
+    return;
+  }
   const item = currentItem();
   if (!item) return;
 
@@ -1909,13 +2215,15 @@ async function deleteCurrentImage() {
     if (response.ok) {
       imagesData.splice(currentIndex, 1);
       if (imagesData.length === 0) {
+        state.catalog.loading = false;
         currentIndex = -1;
         el.imageWrapper.hidden = true;
         imgEl.removeAttribute("src");
-        el.emptyText.style.display = "block";
+        updateEmptyState("这张删掉后，当前数据包里已经没有剩余图片了。");
         updateNavigationUI();
         state.annotations = [];
-        renderAll();
+        clearStaticLayer();
+        renderAll({ staticDirty: true });
       } else {
         const nextIdx = currentIndex >= imagesData.length ? imagesData.length - 1 : currentIndex;
         selectImage(nextIdx);
@@ -1972,6 +2280,11 @@ function setupEvents() {
           renderCanvas();
         }
         break;
+      case "b":
+        if (toggleSelectedVisibility()) {
+          event.preventDefault();
+        }
+        break;
       case "d":
         navigateImage(-1);
         break;
@@ -2009,7 +2322,8 @@ function setupEvents() {
   canvas.addEventListener("contextmenu", onCanvasContextMenu);
   el.canvasArea.addEventListener("wheel", (event) => {
     event.preventDefault();
-    zoomAt(event.clientX, event.clientY, event.deltaY < 0 ? 1.12 : 1 / 1.12);
+    const factor = Math.exp(-event.deltaY * 0.0015);
+    zoomAt(event.clientX, event.clientY, factor);
   }, { passive: false });
   el.canvasArea.addEventListener("dblclick", onCanvasDoubleClick);
   el.canvasArea.addEventListener("contextmenu", (event) => {
@@ -2050,19 +2364,27 @@ function setupEvents() {
 }
 
 window.onload = async () => {
-  try {
-    await activatePackageFromQuery();
-  } catch (error) {
-    console.error(error);
-    updateEmptyState(error.message || "激活数据包失败");
-  }
-
-  await fetchClasses();
-  await fetchImagesList();
   setupEvents();
   updateModeBadge();
   updateZoomBadge();
   window.addEventListener("resize", resizeCanvas);
+  setLoadingState("正在进入数据包...", "先连接数据包并读取首张图片，图片列表会在后台继续补齐。");
+
+  try {
+    await activatePackageFromQuery();
+  } catch (error) {
+    console.error(error);
+    showErrorState(error.message || "激活数据包失败");
+    return;
+  }
+
+  await Promise.all([
+    fetchClasses(),
+    bootstrapAnnotator().catch((error) => {
+      console.error(error);
+      showErrorState(error.message || "读取首张图片失败", "打开数据包失败");
+    }),
+  ]);
 };
 
 window.toggleVisibility = toggleVisibility;
