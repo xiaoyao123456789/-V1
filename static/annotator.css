@@ -183,10 +183,45 @@ select {
   border-color: rgba(216, 168, 74, 0.28);
 }
 
+.btn-save.dirty {
+  color: #7a4d16;
+  background: rgba(216, 168, 74, 0.12);
+  border-color: rgba(216, 168, 74, 0.24);
+}
+
+.btn-save.error {
+  color: #9f3d33;
+  background: rgba(159, 61, 51, 0.12);
+  border-color: rgba(159, 61, 51, 0.26);
+}
+
 .btn-danger {
   color: var(--paper-danger);
   background: rgba(159, 61, 51, 0.08);
   border-color: rgba(159, 61, 51, 0.2);
+}
+
+.annotator-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  z-index: 100;
+  transform: translateX(-50%);
+  max-width: min(520px, calc(100vw - 32px));
+  padding: 10px 14px;
+  border: 1px solid rgba(77, 59, 43, 0.14);
+  border-radius: 12px;
+  background: rgba(255, 252, 247, 0.96);
+  color: var(--paper-text);
+  box-shadow: 0 16px 34px rgba(36, 24, 15, 0.16);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.annotator-toast.error {
+  color: #8f3028;
+  border-color: rgba(159, 61, 51, 0.22);
+  background: rgba(255, 245, 243, 0.97);
 }
 
 .nav-bar {

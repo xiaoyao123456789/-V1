@@ -535,8 +535,7 @@ body.home-mode .top-strip-right {
   flex-wrap: wrap;
 }
 
-.class-tool-btn,
-.class-save-btn {
+.class-tool-btn {
   height: 34px;
   padding: 0 14px;
   border: 1px solid #d7d1c4;
@@ -554,12 +553,6 @@ body.home-mode .top-strip-right {
 .class-tool-btn span {
   margin-left: 6px;
   font-weight: 700;
-}
-
-.class-save-btn {
-  border-color: #2b2822;
-  background: #2b2822;
-  color: #f7f6f2;
 }
 
 .class-list {
@@ -803,46 +796,54 @@ body.home-mode .top-strip-right {
 }
 
 .package-title-line {
-  display: inline-flex;
-  align-items: center;
-  justify-content: flex-start;
-  gap: 8px;
-  flex-wrap: nowrap;
+  display: block;
   margin-bottom: 8px;
-  max-width: 100%;
+  width: 100%;
+  min-width: 0;
+  line-height: 1.55;
 }
 
-.package-name-input {
-  flex: 0 0 auto;
+.package-name-input,
+.package-name-static {
   min-width: 0;
-  width: auto;
-  max-width: 28ch;
-  height: 40px;
-  padding: 0 8px 0 0;
-  border: 1px solid transparent;
-  border-radius: 8px;
-  background: transparent;
+  max-width: 100%;
+  overflow: visible;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
   font-size: 19px;
   font-weight: 600;
   color: var(--ink);
+}
+
+.package-name-input {
+  display: inline;
+  padding: 2px 4px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  cursor: text;
 }
 
 .package-name-input:focus {
   outline: none;
   background: #f6f3ea;
   border-color: var(--line);
-  padding-left: 10px;
-  padding-right: 10px;
+}
+
+.package-name-static {
+  display: inline;
 }
 
 .status-pill {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  flex: 0 0 auto;
   min-height: 26px;
   min-width: 0;
+  margin-left: 8px;
   padding: 0 10px;
+  vertical-align: 2px;
   white-space: nowrap;
   border-radius: 999px;
   font-size: 12px;

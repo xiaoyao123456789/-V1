@@ -55,6 +55,7 @@ const state = {
   catalog: {
     loading: false,
     bootstrapId: "",
+    loadToken: 0,
   },
   view: {
     scale: 1,
@@ -70,6 +71,10 @@ const state = {
     isPanning: false,
     panLastX: 0,
     panLastY: 0,
+    panStartX: 0,
+    panStartY: 0,
+    panStartedOnBlank: false,
+    panMoved: false,
     rightPanActive: false,
     rightPanMoved: false,
     rightPanStartX: 0,
@@ -82,6 +87,18 @@ const state = {
     staticToken: 0,
     staticBuilding: false,
   },
+  save: {
+    inFlight: false,
+    queued: false,
+    manualQueued: false,
+    waiters: [],
+  },
+  hitCache: {
+    version: 0,
+    builtVersion: -1,
+    entries: [],
+  },
+  objectListSignature: "",
 };
 
 const el = {
@@ -137,15 +154,41 @@ function escapeHtml(value) {
 }
 
 function debugLog(...args) {
-  console.log("[annotator-debug]", ...args);
+  if (window.VOC_ANNOTATOR_DEBUG) {
+    console.log("[annotator-debug]", ...args);
+  }
 }
 
 function flashDebugStatus(text) {
+  showToast(text);
+}
+
+function showToast(message, type = "info") {
+  let toast = document.getElementById("annotator-toast");
+  if (!toast) {
+    toast = document.createElement("div");
+    toast.id = "annotator-toast";
+    toast.className = "annotator-toast";
+    document.body.appendChild(toast);
+  }
+  toast.textContent = message;
+  toast.className = `annotator-toast ${type === "error" ? "error" : ""}`;
+  toast.hidden = false;
+  window.clearTimeout(showToast.timer);
+  showToast.timer = window.setTimeout(() => {
+    toast.hidden = true;
+  }, 3200);
+}
+
+function setSaveStatus(text, mode = "saved") {
   el.saveBtn.innerText = text;
-  window.clearTimeout(flashDebugStatus.timer);
-  flashDebugStatus.timer = window.setTimeout(() => {
-    el.saveBtn.innerText = "💾 已保存";
-  }, 1200);
+  el.saveBtn.className = `btn-primary btn-save${mode === "saving" ? " saving" : ""}${mode === "error" ? " error" : ""}${mode === "dirty" ? " dirty" : ""}`;
+  el.saveBtn.style.background = "";
+}
+
+function invalidateAnnotationCaches() {
+  state.hitCache.version += 1;
+  state.objectListSignature = "";
 }
 
 function pageParams() {
@@ -450,15 +493,22 @@ function zoomAt(clientX, clientY, factor) {
   updateCanvasViewport();
 }
 
-function beginPan(clientX, clientY) {
+function beginPan(clientX, clientY, options = {}) {
   state.view.isPanning = true;
   state.view.panLastX = clientX;
   state.view.panLastY = clientY;
+  state.view.panStartX = clientX;
+  state.view.panStartY = clientY;
+  state.view.panStartedOnBlank = options.startedOnBlank === true;
+  state.view.panMoved = false;
   updateCanvasViewport();
 }
 
 function movePan(clientX, clientY) {
   if (!state.view.isPanning) return;
+  if (Math.hypot(clientX - state.view.panStartX, clientY - state.view.panStartY) > 4) {
+    state.view.panMoved = true;
+  }
   state.view.offsetX += clientX - state.view.panLastX;
   state.view.offsetY += clientY - state.view.panLastY;
   state.view.panLastX = clientX;
@@ -468,8 +518,16 @@ function movePan(clientX, clientY) {
 
 function endPan() {
   if (!state.view.isPanning) return;
+  const shouldClearSelection = state.view.panStartedOnBlank && !state.view.panMoved;
   state.view.isPanning = false;
+  state.view.panStartedOnBlank = false;
+  state.view.panMoved = false;
   updateCanvasViewport();
+  if (shouldClearSelection && state.mode === "select" && state.selectedAnnoIndices.length) {
+    clearSelection();
+    hideClassPopup();
+    renderAll();
+  }
 }
 
 function beginRightPan(clientX, clientY) {
@@ -642,6 +700,9 @@ async function prepareImageSelection() {
     state.autoSaveTimer = null;
     await saveAnnotations(true);
   }
+  if (state.save.inFlight || state.save.queued) {
+    await saveAnnotations(true);
+  }
 
   state.historyStack = [];
   state.mode = "select";
@@ -657,14 +718,13 @@ async function prepareImageSelection() {
   state.dragging = null;
   state.popupAnnoIdx = -1;
   hideClassPopup();
+  invalidateAnnotationCaches();
   clearStaticLayer();
   renderAll();
   state.view.forceFitOnNextResize = true;
   resetViewport();
   updateModeBadge();
-  el.saveBtn.innerText = "💾 已保存";
-  el.saveBtn.className = "btn-primary btn-save";
-  el.saveBtn.style.background = "";
+  setSaveStatus("已保存");
 }
 
 function normalizeImageItem(item) {
@@ -680,7 +740,10 @@ function normalizeImageItem(item) {
 
 async function loadImageRecord(img, index) {
   if (!img) return;
+  const loadToken = (state.catalog.loadToken || 0) + 1;
+  state.catalog.loadToken = loadToken;
   await prepareImageSelection();
+  if (state.catalog.loadToken !== loadToken) return;
   currentIndex = index;
   localStorage.setItem("voc_last_image_id", img.id);
 
@@ -693,6 +756,7 @@ async function loadImageRecord(img, index) {
       fetch(`/api/annotations/${encodeURIComponent(img.id)}`),
       fetchReviewSnapshot(img.id),
     ]);
+    if (state.catalog.loadToken !== loadToken || currentItem()?.id !== img.id) return;
     if (annotationResponse.ok) {
       const data = await annotationResponse.json();
       if (Array.isArray(data.annotations)) {
@@ -702,8 +766,9 @@ async function loadImageRecord(img, index) {
     }
   } catch (error) {
     console.error(error);
+    showToast(error.message || "加载标注失败", "error");
   }
-  if (currentItem()?.id !== img.id) return;
+  if (state.catalog.loadToken !== loadToken || currentItem()?.id !== img.id) return;
   renderAll({ staticDirty: true });
 }
 
@@ -759,16 +824,15 @@ async function fetchReviewSnapshot(itemId) {
   }
 }
 
-async function persistReviewSnapshot() {
-  const item = currentItem();
-  if (!item || !isReviewSession()) return;
+async function persistReviewSnapshot(itemId = currentItem()?.id, annotations = state.annotations, deletedSnapshots = state.review.deletedSnapshots) {
+  if (!itemId || !isReviewSession()) return;
   const payload = {
-    deleted: state.review.deletedSnapshots.map((annotation) => ({
+    deleted: deletedSnapshots.map((annotation) => ({
       cls: annotation.cls,
       format: annotation.format,
       points: annotation.points,
     })),
-    added: state.annotations
+    added: annotations
       .filter((annotation) => annotation.reviewAdded)
       .map((annotation) => ({
         cls: annotation.cls,
@@ -777,7 +841,7 @@ async function persistReviewSnapshot() {
       })),
   };
   state.review.addedSnapshots = payload.added.map(normalizeAnnotation).filter(Boolean);
-  const response = await fetch(`/api/review-snapshots/${encodeURIComponent(item.id)}`, {
+  const response = await fetch(`/api/review-snapshots/${encodeURIComponent(itemId)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -796,7 +860,26 @@ function rememberDeletedReviewAnnotations(annotations) {
   });
 }
 
+function objectListSignature() {
+  return JSON.stringify({
+    annotations: state.annotations.map((ann) => ({
+      cls: ann.cls,
+      format: ann.format,
+      visible: ann.visible !== false,
+      reviewAdded: ann.reviewAdded === true,
+      points: ann.points.length,
+    })),
+    selectedAnnoIdx: state.selectedAnnoIdx,
+    selectedAnnoIndices: state.selectedAnnoIndices,
+    selectedPointIdx: state.selectedPointIdx,
+    classes: Object.entries(classesData).map(([key, value]) => [key, value.name, value.color]),
+  });
+}
+
 function renderObjectList() {
+  const signature = objectListSignature();
+  if (state.objectListSignature === signature) return;
+  state.objectListSignature = signature;
   el.objectList.innerHTML = "";
   el.objectCount.innerText = state.annotations.length;
 
@@ -1097,21 +1180,6 @@ function polygonFromObbEdge(start, end, sidePoint) {
   ];
 }
 
-function findPoint(pt) {
-  const threshold = 8 / canvas.width;
-  for (let i = state.annotations.length - 1; i >= 0; i -= 1) {
-    if (!state.annotations[i].visible) continue;
-    if (state.annotations[i].format !== "seg") continue;
-    const points = state.annotations[i].points;
-    for (let j = 0; j < points.length; j += 1) {
-      if (Math.hypot(points[j][0] - pt[0], points[j][1] - pt[1]) < threshold) {
-        return { annoIdx: i, pointIdx: j };
-      }
-    }
-  }
-  return null;
-}
-
 function isPointInPolygon(point, points) {
   const x = point[0];
   const y = point[1];
@@ -1127,10 +1195,61 @@ function isPointInPolygon(point, points) {
   return inside;
 }
 
+function annotationBoundsFromPoints(points) {
+  const xs = points.map((point) => point[0]);
+  const ys = points.map((point) => point[1]);
+  return {
+    minX: Math.min(...xs),
+    maxX: Math.max(...xs),
+    minY: Math.min(...ys),
+    maxY: Math.max(...ys),
+  };
+}
+
+function buildHitCache() {
+  if (state.hitCache.builtVersion === state.hitCache.version) return state.hitCache.entries;
+  state.hitCache.entries = state.annotations.map((annotation, idx) => ({
+    annotation,
+    idx,
+    bounds: annotationBoundsFromPoints(annotation.points || []),
+  }));
+  state.hitCache.builtVersion = state.hitCache.version;
+  return state.hitCache.entries;
+}
+
+function paddedBoundsHit(pt, bounds, pixelPadding = 8) {
+  const width = canvas.width || 1;
+  const height = canvas.height || 1;
+  const padX = pixelPadding / width;
+  const padY = pixelPadding / height;
+  return pt[0] >= bounds.minX - padX
+    && pt[0] <= bounds.maxX + padX
+    && pt[1] >= bounds.minY - padY
+    && pt[1] <= bounds.maxY + padY;
+}
+
+function findPoint(pt) {
+  const entries = buildHitCache();
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    const { annotation, idx, bounds } = entries[i];
+    if (!annotation.visible || annotation.format !== "seg" || !paddedBoundsHit(pt, bounds, 10)) continue;
+    const [px, py] = toPixel(pt);
+    for (let j = 0; j < annotation.points.length; j += 1) {
+      const [x, y] = toPixel(annotation.points[j]);
+      if (Math.hypot(x - px, y - py) < 8) {
+        return { annoIdx: idx, pointIdx: j };
+      }
+    }
+  }
+  return null;
+}
+
 function findAnnotation(pt) {
-  for (let i = state.annotations.length - 1; i >= 0; i -= 1) {
-    if (!state.annotations[i].visible) continue;
-    if (isPointInPolygon(pt, state.annotations[i].points)) return i;
+  const entries = buildHitCache();
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    const { annotation, idx, bounds } = entries[i];
+    if (!annotation.visible || !paddedBoundsHit(pt, bounds, 0)) continue;
+    if (isPointInPolygon(pt, annotation.points)) return idx;
   }
   return -1;
 }
@@ -1173,15 +1292,35 @@ function findAnnotationHit(pt, options = {}) {
   const includeHidden = options.includeHidden === true;
   const onlyHidden = options.onlyHidden === true;
   const edgeThreshold = 8;
-  for (let i = state.annotations.length - 1; i >= 0; i -= 1) {
-    const annotation = state.annotations[i];
+  const entries = buildHitCache();
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    const { annotation, idx, bounds } = entries[i];
     if (onlyHidden && annotation.visible) continue;
     if (!includeHidden && !annotation.visible) continue;
-    if (isPointInPolygon(pt, annotation.points)) return i;
+    if (!paddedBoundsHit(pt, bounds, edgeThreshold)) continue;
+    if (isPointInPolygon(pt, annotation.points)) return idx;
     for (let j = 0; j < annotation.points.length; j += 1) {
       const next = (j + 1) % annotation.points.length;
       if (distanceToSegment(pt, annotation.points[j], annotation.points[next]) <= edgeThreshold) {
-        return i;
+        return idx;
+      }
+    }
+  }
+  return -1;
+}
+
+function findAnnotationEdgeHit(pt, options = {}) {
+  const includeHidden = options.includeHidden === true;
+  const edgeThreshold = options.edgeThreshold || 10;
+  const entries = buildHitCache();
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    const { annotation, idx, bounds } = entries[i];
+    if (!includeHidden && !annotation.visible) continue;
+    if (!paddedBoundsHit(pt, bounds, edgeThreshold)) continue;
+    for (let j = 0; j < annotation.points.length; j += 1) {
+      const next = (j + 1) % annotation.points.length;
+      if (distanceToSegment(pt, annotation.points[j], annotation.points[next]) <= edgeThreshold) {
+        return idx;
       }
     }
   }
@@ -1189,14 +1328,7 @@ function findAnnotationHit(pt, options = {}) {
 }
 
 function annotationBounds(annotation) {
-  const xs = annotation.points.map((point) => point[0]);
-  const ys = annotation.points.map((point) => point[1]);
-  return {
-    minX: Math.min(...xs),
-    maxX: Math.max(...xs),
-    minY: Math.min(...ys),
-    maxY: Math.max(...ys),
-  };
+  return annotationBoundsFromPoints(annotation.points);
 }
 
 function normalizedRect(start, end) {
@@ -1438,6 +1570,16 @@ function hideClassPopup() {
   el.classPopup.innerHTML = "";
 }
 
+function clearSelectionFromBlankPoint(pt) {
+  if (state.mode !== "select") return false;
+  if (findPoint(pt) || findAnnotationHit(pt) !== -1) return false;
+  if (!state.selectedAnnoIndices.length && state.selectedAnnoIdx === -1 && state.selectedPointIdx === -1) return true;
+  clearSelection();
+  hideClassPopup();
+  renderAll();
+  return true;
+}
+
 function onMouseDown(event) {
   if (event.button === 1) {
     event.preventDefault();
@@ -1491,11 +1633,28 @@ function onMouseDown(event) {
     }
   } else {
     state.selectedPointIdx = -1;
-    beginPan(event.clientX, event.clientY);
-    renderCanvas();
+    clearSelectionFromBlankPoint(pt);
+    beginPan(event.clientX, event.clientY, { startedOnBlank: true });
     return;
   }
   renderAll(state.dragging?.type === "annotation" ? { staticDirty: true } : undefined);
+}
+
+function onCanvasClick(event) {
+  if (event.button !== 0 || state.view.isPanning || state.dragging) return;
+  if (event.target !== canvas) return;
+  clearSelectionFromBlankPoint(getNormalizedPos(event));
+}
+
+function onCanvasAreaMouseDown(event) {
+  if (event.target === canvas || event.target.closest("#class-popup")) return;
+  if (event.button !== 0 || state.mode !== "select") return;
+  if (state.selectedAnnoIndices.length || state.selectedAnnoIdx !== -1 || state.selectedPointIdx !== -1) {
+    clearSelection();
+    hideClassPopup();
+    renderAll();
+  }
+  beginPan(event.clientX, event.clientY, { startedOnBlank: true });
 }
 
 function onMouseMove(event) {
@@ -1555,18 +1714,9 @@ function onCanvasContextMenu(event) {
     finishSegDraw();
     return;
   }
-  debugLog("contextmenu", {
-    target: event.target?.tagName,
-    mode: state.mode,
-    currentIndex,
-    canvasWidth: canvas.width,
-    canvasHeight: canvas.height,
-  });
   if (state.mode !== "select") return;
   const pt = getNormalizedPos(event);
   const annoIdx = findAnnotationHit(pt);
-  debugLog("contextmenu-hit", { pt, annoIdx, annotations: state.annotations.length });
-  flashDebugStatus(annoIdx === -1 ? "右键未命中" : `右键命中 #${annoIdx + 1}`);
   if (annoIdx === -1) {
     hideClassPopup();
     return;
@@ -2053,6 +2203,7 @@ function rebuildStaticLayer() {
 
 function renderAll(options = {}) {
   if (options.staticDirty) {
+    invalidateAnnotationCaches();
     rebuildStaticLayer();
   }
   renderCanvas();
@@ -2064,54 +2215,116 @@ function renderAll(options = {}) {
 
 function triggerAutoSave() {
   if (state.autoSaveTimer) clearTimeout(state.autoSaveTimer);
-  el.saveBtn.innerText = "⏳ 保存中...";
-  el.saveBtn.className = "btn-primary btn-save saving";
+  setSaveStatus("未保存", "dirty");
 
   state.autoSaveTimer = setTimeout(() => {
-    saveAnnotations(true);
     state.autoSaveTimer = null;
+    saveAnnotations(true).catch((error) => {
+      console.error(error);
+    });
   }, 500);
 }
 
 async function saveAnnotations(isAuto = false) {
-  const item = currentItem();
-  if (!item) return;
-
-  if (!isAuto) {
-    el.saveBtn.innerText = "⏳ 保存中...";
-    el.saveBtn.className = "btn-primary btn-save saving";
+  if (!isAuto && state.autoSaveTimer) {
+    clearTimeout(state.autoSaveTimer);
+    state.autoSaveTimer = null;
   }
+  return queueSave(!isAuto);
+}
 
-  const payloadData = state.annotations.map((annotation) => ({
+function queueSave(isManual = false) {
+  const item = currentItem();
+  if (!item) return Promise.resolve(false);
+
+  state.save.queued = true;
+  state.save.manualQueued = state.save.manualQueued || isManual;
+  setSaveStatus("保存中...", "saving");
+
+  const promise = new Promise((resolve, reject) => {
+    state.save.waiters.push({ resolve, reject });
+  });
+  if (!state.save.inFlight) {
+    processSaveQueue();
+  }
+  return promise;
+}
+
+function resolveSaveWaiters(value) {
+  const waiters = state.save.waiters.splice(0);
+  waiters.forEach(({ resolve }) => resolve(value));
+}
+
+function rejectSaveWaiters(error) {
+  const waiters = state.save.waiters.splice(0);
+  waiters.forEach(({ reject }) => reject(error));
+}
+
+function savePayloadSnapshot() {
+  return state.annotations.map((annotation) => ({
     cls: annotation.cls,
     format: annotation.format,
-    points: annotation.format === "obb" ? normalizeObbPoints(annotation.points) : annotation.points,
+    points: annotation.format === "obb"
+      ? normalizeObbPoints(annotation.points).map(([x, y]) => [x, y])
+      : annotation.points.map(([x, y]) => [x, y]),
+    visible: annotation.visible,
+    reviewAdded: annotation.reviewAdded === true,
   }));
+}
 
+async function performSave(manualSave) {
+  const item = currentItem();
+  if (!item) return false;
+  const itemId = item.id;
+  const payloadData = savePayloadSnapshot();
+  const deletedSnapshots = cloneReviewEntries(state.review.deletedSnapshots);
+
+  const response = await fetch(`/api/annotations/${encodeURIComponent(itemId)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ annotations: payloadData }),
+  });
+  if (!response.ok) {
+    const message = await response.text();
+    throw new Error(message || "保存失败");
+  }
+  if (isReviewSession()) {
+    await persistReviewSnapshot(itemId, payloadData, deletedSnapshots);
+  }
+  if (currentItem()?.id === itemId) {
+    item.hasLabel = payloadData.length > 0;
+    updateNavigationUI();
+  }
+  if (el.statsModal && !el.statsModal.hidden) {
+    fetchPackageStats().catch(console.error);
+  }
+  if (manualSave) showToast("保存完成");
+  return true;
+}
+
+async function processSaveQueue() {
+  if (state.save.inFlight) return;
+  state.save.inFlight = true;
+  let saved = false;
   try {
-    const response = await fetch(`/api/annotations/${encodeURIComponent(item.id)}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ annotations: payloadData }),
-    });
-    if (response.ok) {
-      if (isReviewSession()) {
-        await persistReviewSnapshot();
-      }
-      item.hasLabel = true;
-      updateNavigationUI();
-      el.saveBtn.innerText = "✅ 已保存";
-      el.saveBtn.className = "btn-primary btn-save";
-      el.saveBtn.style.background = "";
-      if (el.statsModal && !el.statsModal.hidden) {
-        fetchPackageStats().catch(console.error);
-      }
+    while (state.save.queued) {
+      const manualSave = state.save.manualQueued;
+      state.save.queued = false;
+      state.save.manualQueued = false;
+      saved = await performSave(manualSave);
     }
+    setSaveStatus("已保存");
+    resolveSaveWaiters(saved);
   } catch (error) {
     console.error(error);
-    el.saveBtn.innerText = "❌ 保存失败";
-    el.saveBtn.style.background = "#ff4d4f";
-    if (!isAuto) alert("保存失败，请检查后端运行状态");
+    setSaveStatus("保存失败", "error");
+    showToast(error.message || "保存失败，请检查后端运行状态", "error");
+    rejectSaveWaiters(error);
+  } finally {
+    state.save.inFlight = false;
+    if (state.save.queued) {
+      processSaveQueue();
+    }
   }
 }
 
@@ -2157,6 +2370,7 @@ async function bootstrapAnnotator() {
   await loadImageRecord(firstImage, 0);
   fetchImagesList().catch((error) => {
     console.error(error);
+    showToast(error.message || "图片列表加载失败", "error");
     state.catalog.loading = false;
     updateNavigationUI();
   });
@@ -2187,6 +2401,7 @@ async function fetchImagesList() {
   } catch (error) {
     console.error(error);
     state.catalog.loading = false;
+    showToast(error.message || "图片列表加载失败", "error");
     if (!currentItem()) {
       showErrorState("图片列表加载失败，请检查程序目录和数据路径", "读取图片列表失败");
     } else {
@@ -2228,9 +2443,13 @@ async function deleteCurrentImage() {
         const nextIdx = currentIndex >= imagesData.length ? imagesData.length - 1 : currentIndex;
         selectImage(nextIdx);
       }
+    } else {
+      const message = await response.text();
+      throw new Error(message || "删除图片失败");
     }
   } catch (error) {
     console.error(error);
+    showToast(error.message || "删除图片失败", "error");
   }
 }
 
@@ -2330,8 +2549,10 @@ function setupEvents() {
     if (event.target === canvas || event.target === el.classPopup) return;
     onCanvasContextMenu(event);
   });
+  el.canvasArea.addEventListener("mousedown", onCanvasAreaMouseDown);
   canvas.addEventListener("mousedown", onMouseDown);
   canvas.addEventListener("mousemove", onMouseMove);
+  canvas.addEventListener("click", onCanvasClick);
   window.addEventListener("mouseup", onMouseUp);
 
   el.saveBtn.addEventListener("click", () => saveAnnotations(false));

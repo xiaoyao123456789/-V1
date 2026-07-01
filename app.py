@@ -10,9 +10,11 @@ import shutil
 import socket
 import sys
 from datetime import datetime
+from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path, PureWindowsPath
+from threading import Lock
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 from urllib.request import Request, urlopen
@@ -31,6 +33,13 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 LEGACY_CLASSES_FILE = DEFAULT_DATASET_DIR / "classes.json"
 CLASS_COLOR_PALETTE = ["#ff4d4f", "#1890ff", "#52c41a", "#faad14", "#722ed1", "#eb2f96", "#13c2c2", "#fa8c16"]
 HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+STATIC_CACHE_SECONDS = 3600
+IMAGE_CACHE_SECONDS = 86400
+FILE_CHUNK_SIZE = 1024 * 1024
+
+_CACHE_LOCK = Lock()
+_DATASET_LISTING_CACHE: dict[tuple[str, str], tuple[tuple[int, int], list[dict], dict]] = {}
+_PACKAGE_STATS_CACHE: dict[tuple[str, str], tuple[tuple[int, int], dict]] = {}
 
 
 def read_json_file(path: Path, fallback):
@@ -44,7 +53,9 @@ def read_json_file(path: Path, fallback):
 
 def write_json_file(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def is_windows_absolute_path(raw_path: str) -> bool:
@@ -257,6 +268,7 @@ def summarize_dataset_paths(images: Path, labels: Path, mode: str = "split", roo
         raise ValueError("图片目录里没有可用图片")
 
     labels.mkdir(parents=True, exist_ok=True)
+    ensure_empty_label_files(labels, image_map.keys())
     label_map = {p.stem: p for p in labels.iterdir() if p.suffix.lower() == ".txt" and p.is_file()}
 
     summary = dataset_summary(images, labels, mode=mode, root_path=root_path)
@@ -309,6 +321,22 @@ def list_label_stems(labels: Path) -> set[str]:
     return stems
 
 
+def ensure_empty_label_files(labels: Path, image_stems) -> None:
+    labels.mkdir(parents=True, exist_ok=True)
+    for stem in image_stems:
+        label = labels / f"{stem}.txt"
+        if not label.exists():
+            label.touch()
+
+
+def label_has_content(labels: Path, stem: str) -> bool:
+    label = labels / f"{stem}.txt"
+    try:
+        return label.exists() and label.stat().st_size > 0
+    except OSError:
+        return False
+
+
 def image_item_payload(filename: str, stem: str, has_label: bool) -> dict:
     return {
         "id": stem,
@@ -330,9 +358,18 @@ def dataset_listing() -> tuple[list[dict], dict]:
     if not image_entries:
         raise ValueError("图片目录里没有可用图片")
 
-    label_stems = list_label_stems(labels)
     image_stems = {stem for _, stem in image_entries}
-    items = [image_item_payload(name, stem, stem in label_stems) for name, stem in image_entries]
+    ensure_empty_label_files(labels, image_stems)
+    cache_key = dataset_cache_key(images, labels)
+    signature = dataset_cache_signature(images, labels)
+    if cache_key is not None:
+        with _CACHE_LOCK:
+            cached = _DATASET_LISTING_CACHE.get(cache_key)
+            if cached and cached[0] == signature:
+                return cached[1], cached[2]
+
+    label_stems = list_label_stems(labels)
+    items = [image_item_payload(name, stem, label_has_content(labels, stem)) for name, stem in image_entries]
     summary = dataset_summary(
         images,
         labels,
@@ -344,6 +381,9 @@ def dataset_listing() -> tuple[list[dict], dict]:
     summary["missingLabelCount"] = len(image_stems - label_stems)
     summary["extraLabelCount"] = len(label_stems - image_stems)
     summary["hasAnyLabel"] = bool(label_stems)
+    if cache_key is not None:
+        with _CACHE_LOCK:
+            _DATASET_LISTING_CACHE[cache_key] = (signature, items, summary)
     return items, summary
 
 
@@ -375,7 +415,8 @@ def bootstrap_image(preferred_id: str = "") -> tuple[dict | None, int]:
     chosen = preferred_choice or first_choice
     if chosen is None:
         return None, 0
-    return image_item_payload(chosen[0], chosen[1], label_path(chosen[1]).exists()), image_count
+    ensure_empty_label_files(labels, [chosen[1]])
+    return image_item_payload(chosen[0], chosen[1], label_has_content(labels, chosen[1])), image_count
 
 
 def find_image(item_id: str) -> Path | None:
@@ -419,6 +460,35 @@ def display_path(path: Path) -> str:
         return str(path)
 
 
+def dir_signature(path: Path) -> tuple[int, int]:
+    try:
+        stat = path.stat()
+        return (stat.st_mtime_ns, sum(1 for _ in path.iterdir()) if path.is_dir() else 0)
+    except OSError:
+        return (0, 0)
+
+
+def dataset_cache_key(images: Path | None = None, labels: Path | None = None) -> tuple[str, str] | None:
+    try:
+        resolved_images = (images or image_dir()).resolve()
+        resolved_labels = (labels or label_dir()).resolve()
+    except ValueError:
+        return None
+    return (str(resolved_images), str(resolved_labels))
+
+
+def dataset_cache_signature(images: Path, labels: Path) -> tuple[int, int]:
+    image_mtime, image_count = dir_signature(images)
+    label_mtime, label_count = dir_signature(labels)
+    return (image_mtime ^ label_mtime, image_count ^ (label_count << 16))
+
+
+def clear_dataset_caches() -> None:
+    with _CACHE_LOCK:
+        _DATASET_LISTING_CACHE.clear()
+        _PACKAGE_STATS_CACHE.clear()
+
+
 def move_current_to_delete(item_id: str) -> dict:
     image = find_image(item_id)
     if image is None:
@@ -440,6 +510,7 @@ def move_current_to_delete(item_id: str) -> dict:
     else:
         moved["label"] = None
 
+    clear_dataset_caches()
     return moved
 
 
@@ -460,6 +531,7 @@ def validate_dataset(path: Path) -> dict:
 def set_dataset(path: Path) -> dict:
     summary = validate_dataset(path)
     write_json_file(DATASET_FILE, {"selected": True, "path": portable_path_string(path), "allowUnlabeled": False})
+    clear_dataset_caches()
     return summary
 
 
@@ -474,6 +546,7 @@ def set_dataset_paths(images: Path, labels: Path) -> dict:
             "allowUnlabeled": False,
         },
     )
+    clear_dataset_caches()
     return summary
 
 
@@ -488,6 +561,7 @@ def set_dataset_paths_unchecked(images: Path, labels: Path) -> dict:
             "allowUnlabeled": True,
         },
     )
+    clear_dataset_caches()
     return summary
 
 
@@ -500,6 +574,7 @@ def validate_current_dataset() -> dict:
 
 def clear_active_dataset() -> None:
     write_json_file(DATASET_FILE, default_dataset_payload())
+    clear_dataset_caches()
 
 
 def review_snapshot_dir() -> Path:
@@ -578,6 +653,16 @@ def write_review_snapshot(item_id: str, deleted_annotations: list[dict], added_a
 
 def package_annotation_stats() -> dict:
     require_dataset_config()
+    images_path = image_dir()
+    labels_path = label_dir()
+    cache_key = dataset_cache_key(images_path, labels_path)
+    signature = dataset_cache_signature(images_path, labels_path)
+    if cache_key is not None:
+        with _CACHE_LOCK:
+            cached = _PACKAGE_STATS_CACHE.get(cache_key)
+            if cached and cached[0] == signature:
+                return cached[1]
+
     images = image_files()
     counts: dict[str, int] = {}
     total_objects = 0
@@ -590,12 +675,16 @@ def package_annotation_stats() -> dict:
             cls = str(annotation.get("cls", "")).strip()
             counts[cls] = counts.get(cls, 0) + 1
             total_objects += 1
-    return {
+    stats = {
         "imageCount": len(images),
         "labeledImageCount": labeled_images,
         "totalObjects": total_objects,
         "classCounts": counts,
     }
+    if cache_key is not None:
+        with _CACHE_LOCK:
+            _PACKAGE_STATS_CACHE[cache_key] = (signature, stats)
+    return stats
 
 
 def parse_label(path: Path) -> list[dict]:
@@ -686,6 +775,13 @@ def serialize_label(annotations: list[dict]) -> str:
         if len(chunks) >= 7:
             lines.append(" ".join(chunks))
     return "\n".join(lines) + ("\n" if lines else "")
+
+
+def write_text_atomic(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    tmp_path.write_text(content, encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def safe_join(base: Path, request_path: str) -> Path | None:
@@ -839,7 +935,7 @@ def normalize_remote_base(url: str) -> str:
     return base.rstrip("/") + "/"
 
 
-def remote_request(member: dict, path: str, method: str = "GET", payload: dict | None = None) -> dict:
+def remote_request(member: dict, path: str, method: str = "GET", payload: dict | None = None, timeout: float = 10) -> dict:
     base = normalize_remote_base(member.get("homeUrl", ""))
     url = urljoin(base, path.lstrip("/"))
     data = None
@@ -850,7 +946,7 @@ def remote_request(member: dict, path: str, method: str = "GET", payload: dict |
 
     request = Request(url, method=method, data=data, headers=headers)
     try:
-        with urlopen(request, timeout=10) as response:
+        with urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8")
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="ignore").strip()
@@ -1253,8 +1349,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("annotations must be a list")
             label_dir().mkdir(parents=True, exist_ok=True)
             normalized_annotations = normalize_annotation_entries(annotations)
-            label_dir().mkdir(parents=True, exist_ok=True)
-            label_path(item_id).write_text(serialize_label(normalized_annotations), encoding="utf-8")
+            write_text_atomic(label_path(item_id), serialize_label(normalized_annotations))
+            clear_dataset_caches()
         except Exception as exc:
             self.send_error(400, str(exc))
             return
@@ -1394,7 +1490,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404, "Member not found")
             return
         try:
-            remote_request(member, "/api/projects")
+            remote_request(member, "/api/projects", timeout=2)
             self.send_json({"ok": True, "memberId": member_id, "online": True})
         except Exception as exc:
             self.send_json({"ok": True, "memberId": member_id, "online": False, "detail": str(exc)})
@@ -1590,15 +1686,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def list_images(self) -> list[dict]:
         items = []
+        labels = label_dir()
         for image in image_files():
             label = label_path(image.stem)
+            ensure_empty_label_files(labels, [image.stem])
             items.append(
                 {
                     "id": image.stem,
                     "filename": image.name,
                     "imageUrl": f"/data/images/{image.name}",
                     "labelUrl": f"/data/labels/{label.name}",
-                    "hasLabel": label.exists(),
+                    "hasLabel": label_has_content(labels, image.stem),
                 }
             )
         return items
@@ -1608,6 +1706,7 @@ class Handler(BaseHTTPRequestHandler):
         if image is None:
             self.send_error(404, "Image not found")
             return
+        ensure_empty_label_files(label_dir(), [item_id])
         label = label_path(item_id)
         annotations = parse_label(label)
         self.send_json(
@@ -1644,7 +1743,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         if self.command != "HEAD":
-            self.wfile.write(data)
+            try:
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
     def send_json(self, payload: dict, status: int = 200) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -1652,20 +1754,84 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def send_file(self, path: Path | None, include_body: bool = True) -> None:
         if path is None or not path.exists() or not path.is_file():
             self.send_error(404)
             return
+        try:
+            stat = path.stat()
+        except OSError:
+            self.send_error(404)
+            return
+
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        data = path.read_bytes()
-        self.send_response(200)
+        etag = f'"{stat.st_mtime_ns:x}-{stat.st_size:x}"'
+        cache_seconds = STATIC_CACHE_SECONDS if content_type in {"text/css", "application/javascript"} else 0
+        if content_type.startswith("image/"):
+            cache_seconds = IMAGE_CACHE_SECONDS
+
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", f"public, max-age={cache_seconds}" if cache_seconds else "no-cache")
+            self.end_headers()
+            return
+
+        start = 0
+        end = stat.st_size - 1
+        status = 200
+        range_header = self.headers.get("Range", "")
+        if include_body and range_header.startswith("bytes=") and stat.st_size > 0:
+            raw_range = range_header.removeprefix("bytes=").split(",", 1)[0].strip()
+            try:
+                raw_start, _, raw_end = raw_range.partition("-")
+                if raw_start:
+                    start = int(raw_start)
+                    end = int(raw_end) if raw_end else stat.st_size - 1
+                else:
+                    suffix_length = int(raw_end)
+                    start = max(0, stat.st_size - suffix_length)
+                    end = stat.st_size - 1
+                if start < 0 or end < start or start >= stat.st_size:
+                    raise ValueError
+                end = min(end, stat.st_size - 1)
+                status = 206
+            except (TypeError, ValueError):
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{stat.st_size}")
+                self.end_headers()
+                return
+
+        content_length = max(0, end - start + 1)
+        self.send_response(status)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Length", str(content_length))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("ETag", etag)
+        self.send_header("Last-Modified", formatdate(stat.st_mtime, usegmt=True))
+        self.send_header("Cache-Control", f"public, max-age={cache_seconds}" if cache_seconds else "no-cache")
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{stat.st_size}")
         self.end_headers()
-        if include_body:
-            self.wfile.write(data)
+        if not include_body or content_length <= 0:
+            return
+        with path.open("rb") as file:
+            file.seek(start)
+            remaining = content_length
+            while remaining > 0:
+                chunk = file.read(min(FILE_CHUNK_SIZE, remaining))
+                if not chunk:
+                    break
+                try:
+                    self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    break
+                remaining -= len(chunk)
 
     def log_message(self, fmt: str, *args: object) -> None:
         print(f"{self.address_string()} - {fmt % args}")

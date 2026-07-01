@@ -424,7 +424,7 @@ async function saveCurrent() {
     setStatus("保存失败");
     return;
   }
-  item.hasLabel = true;
+  item.hasLabel = state.annotations.length > 0;
   markDirty(false);
   setStatus("已保存");
 }

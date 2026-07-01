@@ -7,6 +7,9 @@ const PACKAGE_STATUS_META = {
 
 const WEEK_LABELS = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"];
 const CLASS_COLOR_PALETTE = ["#ff4d4f", "#1890ff", "#52c41a", "#faad14", "#722ed1", "#eb2f96", "#13c2c2", "#fa8c16"];
+const MEMBER_STATUS_CACHE_MS = 15000;
+const MEMBER_STATUS_TIMEOUT_MS = 2500;
+const MEMBER_STATUS_CONCURRENCY = 4;
 
 const state = {
   projects: [],
@@ -14,7 +17,10 @@ const state = {
   currentView: "home",
   editingMemberId: null,
   editingClassId: null,
+  classAutoSaveTimer: null,
+  classAutoSaveSeq: 0,
   memberStatus: {},
+  memberStatusCheckedAt: {},
   local: {
     currentProjectId: null,
     search: "",
@@ -66,7 +72,6 @@ const el = {
   projectName: document.querySelector("#projectName"),
   projectDescription: document.querySelector("#projectDescription"),
   addClassBtn: document.querySelector("#addClassBtn"),
-  saveClassBtn: document.querySelector("#saveClassBtn"),
   classSkeletonBtn: document.querySelector("#classSkeletonBtn"),
   classModelBtn: document.querySelector("#classModelBtn"),
   classDialogTitle: document.querySelector("#classDialogTitle"),
@@ -293,9 +298,6 @@ function closeDialog(dialog) {
 
 function fitPackageNameInput(input) {
   if (!input) return;
-  const text = input.value?.trim() || input.placeholder || "";
-  const next = Math.max(8, Math.min(text.length + 1, 28));
-  input.style.width = `${next}ch`;
 }
 
 function openProjectDialog() {
@@ -671,7 +673,7 @@ function renderPackages(project) {
             </div>
             <div class="package-main">
               <div class="package-title-line">
-                <input class="package-name-input" type="text" value="${escapeAttr(item.name)}" data-package-name="${item.id}">
+                <span class="package-name-input" contenteditable="true" role="textbox" spellcheck="false" data-package-name="${item.id}" data-previous-value="${escapeAttr(item.name)}">${escapeHtml(item.name)}</span>
                 <span class="status-pill ${status.className}">${status.label}</span>
               </div>
               <p class="package-meta">${escapeHtml(item.remark || "未填写备注")}</p>
@@ -834,7 +836,19 @@ function render() {
 }
 
 async function request(url, options = {}) {
-  const response = await fetch(url, options);
+  const { timeoutMs = 0, ...fetchOptions } = options;
+  let timeoutId = null;
+  if (timeoutMs > 0 && !fetchOptions.signal) {
+    const controller = new AbortController();
+    fetchOptions.signal = controller.signal;
+    timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+  }
+  let response;
+  try {
+    response = await fetch(url, fetchOptions);
+  } finally {
+    if (timeoutId) window.clearTimeout(timeoutId);
+  }
   if (!response.ok) {
     const message = (await response.text()).replace(/<[^>]+>/g, " ").trim() || "请求失败";
     throw new Error(message);
@@ -858,15 +872,38 @@ async function loadTeam() {
 }
 
 async function refreshMemberStatuses() {
-  const results = await Promise.all(state.teamMembers.map(async (member) => {
-    try {
-      const payload = await request(`/api/team/${encodeURIComponent(member.id)}/status`);
-      return [member.id, Boolean(payload.online)];
-    } catch (error) {
-      return [member.id, false];
+  const now = Date.now();
+  const nextStatus = { ...state.memberStatus };
+  const membersToCheck = state.teamMembers.filter((member) => {
+    const checkedAt = state.memberStatusCheckedAt[member.id] || 0;
+    return now - checkedAt > MEMBER_STATUS_CACHE_MS;
+  });
+  let cursor = 0;
+
+  async function worker() {
+    while (cursor < membersToCheck.length) {
+      const member = membersToCheck[cursor];
+      cursor += 1;
+      try {
+        const payload = await request(`/api/team/${encodeURIComponent(member.id)}/status`, {
+          timeoutMs: MEMBER_STATUS_TIMEOUT_MS,
+        });
+        nextStatus[member.id] = Boolean(payload.online);
+      } catch (error) {
+        nextStatus[member.id] = false;
+      }
+      state.memberStatusCheckedAt[member.id] = Date.now();
     }
-  }));
-  state.memberStatus = Object.fromEntries(results);
+  }
+
+  await Promise.all(Array.from(
+    { length: Math.min(MEMBER_STATUS_CONCURRENCY, membersToCheck.length) },
+    () => worker(),
+  ));
+  state.memberStatus = Object.fromEntries(state.teamMembers.map((member) => [member.id, Boolean(nextStatus[member.id])]));
+  state.memberStatusCheckedAt = Object.fromEntries(
+    Object.entries(state.memberStatusCheckedAt).filter(([memberId]) => state.teamMembers.some((member) => member.id === memberId)),
+  );
 }
 
 async function refreshAll({ silentTeamError = true } = {}) {
@@ -878,6 +915,7 @@ async function refreshAll({ silentTeamError = true } = {}) {
     console.error(error);
     state.teamMembers = [];
     state.memberStatus = {};
+    state.memberStatusCheckedAt = {};
     if (!silentTeamError) throw error;
   }
   try {
@@ -915,21 +953,41 @@ function nextClassId() {
   return String(id);
 }
 
-function addClassRow() {
+async function addClassRow() {
   const key = nextClassId();
   const color = CLASS_COLOR_PALETTE[Object.keys(state.local.editingClasses).length % CLASS_COLOR_PALETTE.length];
+  const previous = JSON.parse(JSON.stringify(state.local.editingClasses));
   state.local.editingClasses[key] = { name: `class_${key}`, color };
-  openClassDialog(key, true);
+  renderClassSection(currentProject());
+  try {
+    await persistProjectClasses("新增标签已自动保存");
+    openClassDialog(key, true);
+  } catch (error) {
+    state.local.editingClasses = previous;
+    renderClassSection(currentProject());
+    showStatus(error.message || "新增标签失败", "error");
+  }
 }
 
-function deleteClassRow(classId) {
+async function deleteClassRow(classId) {
   const remaining = Object.keys(state.local.editingClasses).length;
   if (remaining <= 1) {
     showStatus("至少保留一个类别", "error");
     return;
   }
+  const targetClass = state.local.editingClasses[classId];
+  if (!window.confirm(`确定删除标签“${targetClass?.name || classId}”吗？`)) return;
+  const previous = JSON.parse(JSON.stringify(state.local.editingClasses));
   delete state.local.editingClasses[classId];
+  if (state.editingClassId === classId) closeClassDialog();
   renderClassSection(currentProject());
+  try {
+    await persistProjectClasses("标签已删除");
+  } catch (error) {
+    state.local.editingClasses = previous;
+    renderClassSection(currentProject());
+    showStatus(error.message || "删除标签失败", "error");
+  }
 }
 
 function openClassDialog(classId, isNew = false) {
@@ -945,25 +1003,60 @@ function openClassDialog(classId, isNew = false) {
 }
 
 function closeClassDialog() {
+  if (state.classAutoSaveTimer) {
+    window.clearTimeout(state.classAutoSaveTimer);
+    state.classAutoSaveTimer = null;
+    persistProjectClasses("", { silent: true }).catch((error) => showStatus(error.message, "error"));
+  }
   state.editingClassId = null;
   if (el.classDialog.open) closeDialog(el.classDialog);
 }
 
-async function saveProjectClasses() {
+async function persistProjectClasses(message = "类别标签已自动保存", options = {}) {
   const project = currentProject();
   if (!project) return;
+  const classesSnapshot = JSON.parse(JSON.stringify(state.local.editingClasses));
+  const snapshotSignature = JSON.stringify(classesSnapshot);
   const payload = await request(`/api/projects/${encodeURIComponent(project.id)}/classes`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ classes: state.local.editingClasses }),
+    body: JSON.stringify({ classes: classesSnapshot }),
   });
   const target = state.projects.find((item) => item.id === project.id);
   if (target) {
     target.classes = payload.classes || {};
   }
-  syncEditingClasses();
-  render();
-  showStatus("类别标签已保存");
+  if (JSON.stringify(state.local.editingClasses) === snapshotSignature) {
+    syncEditingClasses();
+  }
+  renderClassSection(currentProject());
+  if (!options.silent && message) showStatus(message);
+}
+
+function updateEditingClassFromForm() {
+  const classId = state.editingClassId;
+  if (!classId || !state.local.editingClasses[classId]) return false;
+  state.local.editingClasses[classId] = {
+    name: el.classNameInput.value.trim() || classId,
+    color: el.classColorInput.value,
+  };
+  renderClassSection(currentProject());
+  return true;
+}
+
+function scheduleClassAutoSave() {
+  if (!updateEditingClassFromForm()) return;
+  const saveSeq = state.classAutoSaveSeq + 1;
+  state.classAutoSaveSeq = saveSeq;
+  if (state.classAutoSaveTimer) window.clearTimeout(state.classAutoSaveTimer);
+  state.classAutoSaveTimer = window.setTimeout(() => {
+    state.classAutoSaveTimer = null;
+    persistProjectClasses("", { silent: true })
+      .then(() => {
+        if (state.classAutoSaveSeq === saveSeq) showStatus("标签已自动保存");
+      })
+      .catch((error) => showStatus(error.message || "标签自动保存失败", "error"));
+  }, 350);
 }
 
 async function deleteProject(projectId) {
@@ -1027,6 +1120,8 @@ async function deleteMember(memberId) {
   await request(`/api/team/${encodeURIComponent(memberId)}`, {
     method: "DELETE",
   });
+  delete state.memberStatus[memberId];
+  delete state.memberStatusCheckedAt[memberId];
   showStatus("成员已删除");
   await refreshAll();
 }
@@ -1124,6 +1219,32 @@ async function openAnnotator(projectId, packageId) {
   window.location.href = `/annotator?${params.toString()}`;
 }
 
+function packageNameText(input) {
+  return (input.textContent ?? input.value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function savePackageNameInput(input) {
+  if (!input || !currentProject()) return;
+  const nextName = packageNameText(input);
+  const previousName = input.dataset.previousValue || "";
+  if (!nextName) {
+    input.textContent = previousName;
+    showStatus("数据包名称不能为空", "error");
+    return;
+  }
+  if (nextName === previousName) return;
+  input.dataset.previousValue = nextName;
+  input.textContent = nextName;
+  request(`/api/projects/${encodeURIComponent(currentProject().id)}/packages/${encodeURIComponent(input.dataset.packageName)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: nextName }),
+  })
+    .then(() => refreshAll())
+    .then(() => showStatus("数据包名称已更新"))
+    .catch((error) => showStatus(error.message, "error"));
+}
+
 function handleViewJump(view) {
   if (view === "projects") {
     setProjectsView();
@@ -1190,11 +1311,7 @@ el.packageForm.addEventListener("submit", (event) => {
 });
 
 el.addClassBtn.addEventListener("click", () => {
-  addClassRow();
-});
-
-el.saveClassBtn.addEventListener("click", () => {
-  saveProjectClasses().catch((error) => showStatus(error.message, "error"));
+  addClassRow().catch((error) => showStatus(error.message || "新增标签失败", "error"));
 });
 
 el.classSkeletonBtn.addEventListener("click", () => {
@@ -1207,15 +1324,13 @@ el.classModelBtn.addEventListener("click", () => {
 
 el.classForm.addEventListener("submit", (event) => {
   event.preventDefault();
-  const classId = state.editingClassId;
-  if (!classId || !state.local.editingClasses[classId]) return;
-  state.local.editingClasses[classId] = {
-    name: el.classNameInput.value.trim() || classId,
-    color: el.classColorInput.value,
-  };
+  updateEditingClassFromForm();
   closeClassDialog();
-  renderClassSection(currentProject());
 });
+
+el.classNameInput.addEventListener("input", scheduleClassAutoSave);
+el.classColorInput.addEventListener("input", scheduleClassAutoSave);
+el.classColorInput.addEventListener("change", scheduleClassAutoSave);
 
 el.memberForm.addEventListener("submit", (event) => {
   createMember(event).catch((error) => showStatus(error.message, "error"));
@@ -1226,6 +1341,10 @@ document.querySelectorAll("[data-close]").forEach((button) => {
     const dialog = document.querySelector(`#${button.dataset.close}`);
     if (button.dataset.close === "memberDialog") {
       state.editingMemberId = null;
+    }
+    if (button.dataset.close === "classDialog") {
+      closeClassDialog();
+      return;
     }
     if (dialog) closeDialog(dialog);
   });
@@ -1358,14 +1477,7 @@ el.grid.addEventListener("keydown", (event) => {
 el.grid.addEventListener("change", (event) => {
   const input = event.target.closest("[data-package-name]");
   if (!input || !currentProject()) return;
-  request(`/api/projects/${encodeURIComponent(currentProject().id)}/packages/${encodeURIComponent(input.dataset.packageName)}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: input.value.trim() }),
-  })
-    .then(() => refreshAll())
-    .then(() => showStatus("数据包名称已更新"))
-    .catch((error) => showStatus(error.message, "error"));
+  savePackageNameInput(input);
 });
 
 el.grid.addEventListener("input", (event) => {
@@ -1374,8 +1486,19 @@ el.grid.addEventListener("input", (event) => {
   fitPackageNameInput(input);
 });
 
-el.classList.addEventListener("input", (event) => {
-  return;
+el.grid.addEventListener("focusout", (event) => {
+  const input = event.target.closest("[data-package-name]");
+  if (!input) return;
+  savePackageNameInput(input);
+});
+
+el.grid.addEventListener("keydown", (event) => {
+  const input = event.target.closest("[data-package-name]");
+  if (!input) return;
+  if (event.key === "Enter") {
+    event.preventDefault();
+    input.blur();
+  }
 });
 
 el.classList.addEventListener("click", (event) => {
@@ -1386,7 +1509,7 @@ el.classList.addEventListener("click", (event) => {
   }
   const deleteAction = event.target.closest("[data-delete-class]");
   if (!deleteAction) return;
-  deleteClassRow(deleteAction.dataset.deleteClass);
+  deleteClassRow(deleteAction.dataset.deleteClass).catch((error) => showStatus(error.message || "删除标签失败", "error"));
 });
 
 document.addEventListener("click", (event) => {
@@ -1403,6 +1526,9 @@ window.addEventListener("keydown", (event) => {
     if (el.memberDialog.open) {
       state.editingMemberId = null;
       closeDialog(el.memberDialog);
+    }
+    if (el.classDialog.open) {
+      closeClassDialog();
     }
   }
 });
