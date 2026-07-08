@@ -704,17 +704,34 @@ def parse_label(path: Path) -> list[dict]:
             cls = header
             format_name = "seg"
         coords = parts[1:]
-        if len(coords) < 6 or len(coords) % 2:
-            print(f"Skip invalid label line {path}:{line_no}", file=sys.stderr)
-            continue
-
-        points = []
         try:
-            for i in range(0, len(coords), 2):
-                points.append([float(coords[i]), float(coords[i + 1])])
+            values = [float(coord) for coord in coords]
         except ValueError:
             print(f"Skip non-numeric label line {path}:{line_no}", file=sys.stderr)
             continue
+        if len(values) == 4:
+            x_center, y_center, width, height = values
+            if width <= 0 or height <= 0:
+                print(f"Skip invalid label line {path}:{line_no}", file=sys.stderr)
+                continue
+            min_x = max(0.0, min(1.0, x_center - width / 2))
+            min_y = max(0.0, min(1.0, y_center - height / 2))
+            max_x = max(0.0, min(1.0, x_center + width / 2))
+            max_y = max(0.0, min(1.0, y_center + height / 2))
+            points = [
+                [min_x, min_y],
+                [max_x, min_y],
+                [max_x, max_y],
+                [min_x, max_y],
+            ]
+            format_name = "hbb"
+        elif len(values) < 6 or len(values) % 2:
+            print(f"Skip invalid label line {path}:{line_no}", file=sys.stderr)
+            continue
+        else:
+            points = []
+            for i in range(0, len(values), 2):
+                points.append([values[i], values[i + 1]])
         annotations.append({
             "cls": cls,
             "format": infer_annotation_format(points, format_name),

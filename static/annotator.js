@@ -19,6 +19,10 @@ const imgEl = document.getElementById("main-image");
 const OBB_ROTATE_STEP = Math.PI / 180;
 const STATIC_RENDER_BATCH = 160;
 const STATIC_LABEL_LIMIT = 220;
+const CORNER_HANDLE_RADIUS = 6;
+const SELECTED_HANDLE_RADIUS = 8;
+const EDGE_HANDLE_RADIUS = 5;
+const HANDLE_HIT_RADIUS = 12;
 
 const state = {
   mode: "select",
@@ -48,6 +52,7 @@ const state = {
   selectedAnnoIndices: [],
   hoveredAnnoIdx: -1,
   selectedPointIdx: -1,
+  selectedHandleType: "",
   dragging: null,
   historyStack: [],
   autoSaveTimer: null,
@@ -283,6 +288,7 @@ function clearSelection() {
   state.selectedAnnoIdx = -1;
   state.selectedAnnoIndices = [];
   state.selectedPointIdx = -1;
+  state.selectedHandleType = "";
 }
 
 function setSelection(indices, primaryIdx = null) {
@@ -291,6 +297,7 @@ function setSelection(indices, primaryIdx = null) {
   state.selectedAnnoIdx = next.length ? (next.includes(primaryIdx) ? primaryIdx : next[next.length - 1]) : -1;
   if (!next.includes(state.selectedAnnoIdx)) {
     state.selectedPointIdx = -1;
+    state.selectedHandleType = "";
   }
 }
 
@@ -715,6 +722,7 @@ async function prepareImageSelection() {
   state.selectedAnnoIndices = [];
   state.hoveredAnnoIdx = -1;
   state.selectedPointIdx = -1;
+  state.selectedHandleType = "";
   state.dragging = null;
   state.popupAnnoIdx = -1;
   hideClassPopup();
@@ -872,6 +880,7 @@ function objectListSignature() {
     selectedAnnoIdx: state.selectedAnnoIdx,
     selectedAnnoIndices: state.selectedAnnoIndices,
     selectedPointIdx: state.selectedPointIdx,
+    selectedHandleType: state.selectedHandleType,
     classes: Object.entries(classesData).map(([key, value]) => [key, value.name, value.color]),
   });
 }
@@ -1056,6 +1065,39 @@ function polygonFromHbb(start, end) {
   ];
 }
 
+function resizeHbbFromPoint(points, pointIdx, pt) {
+  if (!Array.isArray(points) || points.length !== 4) return points;
+  const oppositeIdx = (pointIdx + 2) % 4;
+  return polygonFromHbb(points[oppositeIdx], pt);
+}
+
+function resizeHbbFromEdge(points, edgeIdx, pt) {
+  if (!Array.isArray(points) || points.length !== 4) return points;
+  const xs = points.map((point) => point[0]);
+  const ys = points.map((point) => point[1]);
+  let minX = Math.min(...xs);
+  let maxX = Math.max(...xs);
+  let minY = Math.min(...ys);
+  let maxY = Math.max(...ys);
+  if (edgeIdx === 0) minY = pt[1];
+  if (edgeIdx === 1) maxX = pt[0];
+  if (edgeIdx === 2) maxY = pt[1];
+  if (edgeIdx === 3) minX = pt[0];
+  return polygonFromHbb([minX, minY], [maxX, maxY]);
+}
+
+function midpoint(start, end) {
+  return [(start[0] + end[0]) / 2, (start[1] + end[1]) / 2];
+}
+
+function dotProduct(a, b) {
+  return (a[0] * b[0]) + (a[1] * b[1]);
+}
+
+function subtractPoints(a, b) {
+  return [a[0] - b[0], a[1] - b[1]];
+}
+
 function rotateAnnotationPoints(points, angleDelta, center) {
   return points.map((point) => rotatePoint(point, angleDelta, center));
 }
@@ -1117,6 +1159,74 @@ function buildObbPoints(center, width, height, angle, normalSign = 1) {
     [cx + (ux * halfWidth) + (vx * halfHeight), cy + (uy * halfWidth) + (vy * halfHeight)],
     [cx - (ux * halfWidth) + (vx * halfHeight), cy - (uy * halfWidth) + (vy * halfHeight)],
   ];
+}
+
+function obbAxes(geometry) {
+  const ux = Math.cos(geometry.angle);
+  const uy = Math.sin(geometry.angle);
+  return {
+    u: [ux, uy],
+    v: [-uy * geometry.normalSign, ux * geometry.normalSign],
+  };
+}
+
+function resizeObbFromPoint(points, pointIdx, pt) {
+  if (!hasCanvasMetrics() || !Array.isArray(points) || points.length !== 4) return null;
+  const pixelPoints = points.map(imagePointToPixel);
+  const geometry = obbGeometryFromPoints(pixelPoints);
+  if (!geometry) return null;
+  const { u, v } = obbAxes(geometry);
+  const pointSigns = [
+    [-1, -1],
+    [1, -1],
+    [1, 1],
+    [-1, 1],
+  ];
+  const [signU, signV] = pointSigns[pointIdx] || pointSigns[0];
+  const opposite = pixelPoints[(pointIdx + 2) % 4];
+  const dragPoint = imagePointToPixel(pt);
+  const delta = subtractPoints(dragPoint, opposite);
+  const width = Math.max(6, signU * dotProduct(delta, u));
+  const height = Math.max(6, signV * dotProduct(delta, v));
+  const center = [
+    opposite[0] + (signU * u[0] * width / 2) + (signV * v[0] * height / 2),
+    opposite[1] + (signU * u[1] * width / 2) + (signV * v[1] * height / 2),
+  ];
+  const resized = buildObbPoints(center, width, height, geometry.angle, geometry.normalSign).map(pixelPointToImage);
+  return pointsInsideImage(resized) ? resized.map(clampPoint) : points;
+}
+
+function resizeObbFromEdge(points, edgeIdx, pt) {
+  if (!hasCanvasMetrics() || !Array.isArray(points) || points.length !== 4) return null;
+  const pixelPoints = points.map(imagePointToPixel);
+  const geometry = obbGeometryFromPoints(pixelPoints);
+  if (!geometry) return null;
+  const { u, v } = obbAxes(geometry);
+  const dragPoint = imagePointToPixel(pt);
+  let center = geometry.center;
+  let width = geometry.width;
+  let height = geometry.height;
+
+  if (edgeIdx === 0) {
+    const opposite = midpoint(pixelPoints[2], pixelPoints[3]);
+    height = Math.max(6, dotProduct(subtractPoints(opposite, dragPoint), v));
+    center = [opposite[0] - (v[0] * height / 2), opposite[1] - (v[1] * height / 2)];
+  } else if (edgeIdx === 1) {
+    const opposite = midpoint(pixelPoints[3], pixelPoints[0]);
+    width = Math.max(6, dotProduct(subtractPoints(dragPoint, opposite), u));
+    center = [opposite[0] + (u[0] * width / 2), opposite[1] + (u[1] * width / 2)];
+  } else if (edgeIdx === 2) {
+    const opposite = midpoint(pixelPoints[0], pixelPoints[1]);
+    height = Math.max(6, dotProduct(subtractPoints(dragPoint, opposite), v));
+    center = [opposite[0] + (v[0] * height / 2), opposite[1] + (v[1] * height / 2)];
+  } else if (edgeIdx === 3) {
+    const opposite = midpoint(pixelPoints[1], pixelPoints[2]);
+    width = Math.max(6, dotProduct(subtractPoints(opposite, dragPoint), u));
+    center = [opposite[0] - (u[0] * width / 2), opposite[1] - (u[1] * width / 2)];
+  }
+
+  const resized = buildObbPoints(center, width, height, geometry.angle, geometry.normalSign).map(pixelPointToImage);
+  return pointsInsideImage(resized) ? resized.map(clampPoint) : points;
 }
 
 function normalizeObbPoints(points) {
@@ -1232,12 +1342,21 @@ function findPoint(pt) {
   const entries = buildHitCache();
   for (let i = entries.length - 1; i >= 0; i -= 1) {
     const { annotation, idx, bounds } = entries[i];
-    if (!annotation.visible || annotation.format !== "seg" || !paddedBoundsHit(pt, bounds, 10)) continue;
+    if (!annotation.visible || !annotation.points?.length || !paddedBoundsHit(pt, bounds, HANDLE_HIT_RADIUS)) continue;
     const [px, py] = toPixel(pt);
     for (let j = 0; j < annotation.points.length; j += 1) {
       const [x, y] = toPixel(annotation.points[j]);
-      if (Math.hypot(x - px, y - py) < 8) {
-        return { annoIdx: idx, pointIdx: j };
+      if (Math.hypot(x - px, y - py) < HANDLE_HIT_RADIUS) {
+        return { annoIdx: idx, pointIdx: j, handleType: "corner" };
+      }
+    }
+    if (annotation.format !== "seg" && annotation.points.length === 4) {
+      for (let j = 0; j < annotation.points.length; j += 1) {
+        const next = (j + 1) % annotation.points.length;
+        const [x, y] = toPixel(midpoint(annotation.points[j], annotation.points[next]));
+        if (Math.hypot(x - px, y - py) < HANDLE_HIT_RADIUS) {
+          return { annoIdx: idx, pointIdx: j, handleType: "edge" };
+        }
       }
     }
   }
@@ -1367,6 +1486,7 @@ function insertPointIntoSegAnnotation(annoIdx, pt) {
   annotation.points.splice(bestEdge + 1, 0, bestPoint.map((value) => Number(value)));
   setSingleSelection(annoIdx);
   state.selectedPointIdx = bestEdge + 1;
+  state.selectedHandleType = "corner";
   renderAll({ staticDirty: true });
   triggerAutoSave();
   return true;
@@ -1602,10 +1722,13 @@ function onMouseDown(event) {
     saveState();
     setSingleSelection(pointHit.annoIdx);
     state.selectedPointIdx = pointHit.pointIdx;
+    state.selectedHandleType = pointHit.handleType;
     state.dragging = {
       type: "point",
       annoIdx: pointHit.annoIdx,
       pointIdx: pointHit.pointIdx,
+      handleType: pointHit.handleType,
+      originalPoints: state.annotations[pointHit.annoIdx].points.map(([x, y]) => [x, y]),
     };
     renderAll({ staticDirty: true });
     return;
@@ -1617,11 +1740,13 @@ function onMouseDown(event) {
     if (event.ctrlKey || event.metaKey) {
       toggleSelection(annoIdx);
       state.selectedPointIdx = -1;
+      state.selectedHandleType = "";
       renderAll();
       return;
     }
     setSingleSelection(annoIdx);
     state.selectedPointIdx = -1;
+    state.selectedHandleType = "";
     if (annotation?.format !== "seg") {
       saveState();
       state.dragging = {
@@ -1633,6 +1758,7 @@ function onMouseDown(event) {
     }
   } else {
     state.selectedPointIdx = -1;
+    state.selectedHandleType = "";
     clearSelectionFromBlankPoint(pt);
     beginPan(event.clientX, event.clientY, { startedOnBlank: true });
     return;
@@ -1680,9 +1806,18 @@ function onMouseMove(event) {
   if (state.dragging?.type === "point") {
     const target = state.annotations[state.dragging.annoIdx];
     if (!target) return;
-    target.points[state.dragging.pointIdx] = clampPoint(pt);
-    if (target.format === "hbb") {
-      target.points = polygonFromHbb(target.points[0], target.points[2]).map((point) => clampPoint(point));
+    if (target.format === "hbb" && state.dragging.handleType === "edge") {
+      target.points = resizeHbbFromEdge(state.dragging.originalPoints, state.dragging.pointIdx, pt).map((point) => clampPoint(point));
+    } else if (target.format === "hbb") {
+      target.points = resizeHbbFromPoint(state.dragging.originalPoints, state.dragging.pointIdx, pt).map((point) => clampPoint(point));
+    } else if (target.format === "obb" && state.dragging.handleType === "edge") {
+      const resized = resizeObbFromEdge(state.dragging.originalPoints, state.dragging.pointIdx, pt);
+      if (resized) target.points = resized;
+    } else if (target.format === "obb") {
+      const resized = resizeObbFromPoint(state.dragging.originalPoints, state.dragging.pointIdx, pt);
+      if (resized) target.points = resized;
+    } else {
+      target.points[state.dragging.pointIdx] = clampPoint(pt);
     }
     renderCanvas();
     return;
@@ -1725,6 +1860,7 @@ function onCanvasContextMenu(event) {
     setSingleSelection(annoIdx);
   }
   state.selectedPointIdx = -1;
+  state.selectedHandleType = "";
   renderAll();
   showClassPopup(event.clientX, event.clientY, annoIdx);
 }
@@ -1792,6 +1928,7 @@ function deleteSelection() {
     if (state.selectedPointIdx !== -1 && annotation.format === "seg") {
       annotation.points.splice(state.selectedPointIdx, 1);
       state.selectedPointIdx = -1;
+      state.selectedHandleType = "";
       if (annotation.points.length < 3) {
         rememberDeletedReviewAnnotations([annotation]);
         state.annotations.splice(state.selectedAnnoIdx, 1);
@@ -1916,12 +2053,27 @@ imgEl.onload = () => {
 function drawPoint(pt, fillColor) {
   const [x, y] = toPixel(pt);
   ctx.beginPath();
-  ctx.arc(x, y, fillColor === "yellow" ? 6 : 4, 0, Math.PI * 2);
+  ctx.arc(x, y, fillColor === "yellow" ? SELECTED_HANDLE_RADIUS : CORNER_HANDLE_RADIUS, 0, Math.PI * 2);
   ctx.fillStyle = fillColor;
   ctx.fill();
   ctx.strokeStyle = "#000";
-  ctx.lineWidth = 1;
+  ctx.lineWidth = 1.5;
   ctx.stroke();
+}
+
+function drawEdgeHandle(pt, isSelected = false) {
+  const [x, y] = toPixel(pt);
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(Math.PI / 4);
+  ctx.beginPath();
+  ctx.rect(-EDGE_HANDLE_RADIUS, -EDGE_HANDLE_RADIUS, EDGE_HANDLE_RADIUS * 2, EDGE_HANDLE_RADIUS * 2);
+  ctx.fillStyle = isSelected ? "yellow" : "#ffffff";
+  ctx.fill();
+  ctx.strokeStyle = "#000";
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.restore();
 }
 
 function renderSelectionMarquee(renderCtx = ctx) {
@@ -2091,7 +2243,15 @@ function drawAnnotation(annotation, idx, preview = false) {
   ctx.shadowBlur = 0;
 
   if (isPrimarySelected) {
-    annotation.points.forEach((pt, pointIdx) => drawPoint(pt, pointIdx === state.selectedPointIdx ? "yellow" : "white"));
+    if (annotation.format !== "seg" && annotation.points.length === 4) {
+      annotation.points.forEach((pt, pointIdx) => {
+        const next = annotation.points[(pointIdx + 1) % annotation.points.length];
+        drawEdgeHandle(midpoint(pt, next), state.selectedHandleType === "edge" && pointIdx === state.selectedPointIdx);
+      });
+    }
+    annotation.points.forEach((pt, pointIdx) => {
+      drawPoint(pt, state.selectedHandleType === "corner" && pointIdx === state.selectedPointIdx ? "yellow" : "white");
+    });
   }
 
 }
