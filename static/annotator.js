@@ -19,10 +19,11 @@ const imgEl = document.getElementById("main-image");
 const OBB_ROTATE_STEP = Math.PI / 180;
 const STATIC_RENDER_BATCH = 160;
 const STATIC_LABEL_LIMIT = 220;
-const CORNER_HANDLE_RADIUS = 6;
-const SELECTED_HANDLE_RADIUS = 8;
-const EDGE_HANDLE_RADIUS = 5;
-const HANDLE_HIT_RADIUS = 12;
+const CORNER_HANDLE_RADIUS = 10;
+const SELECTED_HANDLE_RADIUS = 12;
+const EDGE_HANDLE_RADIUS = 9;
+const HANDLE_HIT_RADIUS = 17;
+const DUPLICATE_OVERLAP_THRESHOLD = 0.95;
 
 const state = {
   mode: "select",
@@ -51,6 +52,7 @@ const state = {
   selectedAnnoIdx: -1,
   selectedAnnoIndices: [],
   hoveredAnnoIdx: -1,
+  hoveredHandle: null,
   selectedPointIdx: -1,
   selectedHandleType: "",
   dragging: null,
@@ -289,6 +291,10 @@ function clearSelection() {
   state.selectedAnnoIndices = [];
   state.selectedPointIdx = -1;
   state.selectedHandleType = "";
+}
+
+function clearHoveredHandle() {
+  state.hoveredHandle = null;
 }
 
 function setSelection(indices, primaryIdx = null) {
@@ -721,6 +727,7 @@ async function prepareImageSelection() {
   state.selectedAnnoIdx = -1;
   state.selectedAnnoIndices = [];
   state.hoveredAnnoIdx = -1;
+  state.hoveredHandle = null;
   state.selectedPointIdx = -1;
   state.selectedHandleType = "";
   state.dragging = null;
@@ -898,11 +905,17 @@ function renderObjectList() {
     const isPrimary = idx === state.selectedAnnoIdx;
     li.className = `object-item ${isSelected ? "active" : ""} ${isPrimary ? "primary" : ""} ${!ann.visible ? "hidden" : ""}`;
     li.onmouseenter = () => {
+      if (state.selectedAnnoIndices.length && !selectionIncludes(idx)) {
+        clearSelection();
+        hideClassPopup();
+      }
       state.hoveredAnnoIdx = idx;
-      renderCanvas();
+      clearHoveredHandle();
+      renderAll();
     };
     li.onmouseleave = () => {
       state.hoveredAnnoIdx = -1;
+      clearHoveredHandle();
       renderCanvas();
     };
     li.onclick = (event) => {
@@ -984,6 +997,7 @@ function deleteObject(event, idx) {
     .map((item) => (item > idx ? item - 1 : item));
   setSelection(nextSelection, state.selectedAnnoIdx > idx ? state.selectedAnnoIdx - 1 : state.selectedAnnoIdx);
   if (state.hoveredAnnoIdx === idx) state.hoveredAnnoIdx = -1;
+  if (state.hoveredHandle?.annoIdx === idx) clearHoveredHandle();
   hideClassPopup();
   renderAll({ staticDirty: true });
   triggerAutoSave();
@@ -1314,6 +1328,119 @@ function annotationBoundsFromPoints(points) {
     minY: Math.min(...ys),
     maxY: Math.max(...ys),
   };
+}
+
+function polygonSignedArea(points) {
+  let area = 0;
+  for (let i = 0; i < points.length; i += 1) {
+    const next = (i + 1) % points.length;
+    area += (points[i][0] * points[next][1]) - (points[next][0] * points[i][1]);
+  }
+  return area / 2;
+}
+
+function polygonArea(points) {
+  return Math.abs(polygonSignedArea(points));
+}
+
+function crossProduct(a, b, c) {
+  return ((b[0] - a[0]) * (c[1] - a[1])) - ((b[1] - a[1]) * (c[0] - a[0]));
+}
+
+function lineIntersection(a, b, c, d) {
+  const x1 = a[0];
+  const y1 = a[1];
+  const x2 = b[0];
+  const y2 = b[1];
+  const x3 = c[0];
+  const y3 = c[1];
+  const x4 = d[0];
+  const y4 = d[1];
+  const denominator = ((x1 - x2) * (y3 - y4)) - ((y1 - y2) * (x3 - x4));
+  if (Math.abs(denominator) < 1e-9) return b;
+  return [
+    (((x1 * y2 - y1 * x2) * (x3 - x4)) - ((x1 - x2) * (x3 * y4 - y3 * x4))) / denominator,
+    (((x1 * y2 - y1 * x2) * (y3 - y4)) - ((y1 - y2) * (x3 * y4 - y3 * x4))) / denominator,
+  ];
+}
+
+function clipPolygon(subject, clip) {
+  if (!Array.isArray(subject) || !Array.isArray(clip) || subject.length < 3 || clip.length < 3) return [];
+  let output = subject.map(([x, y]) => [x, y]);
+  const orientation = polygonSignedArea(clip) >= 0 ? 1 : -1;
+  const isInside = (point, start, end) => orientation * crossProduct(start, end, point) >= -1e-9;
+
+  for (let i = 0; i < clip.length; i += 1) {
+    const clipStart = clip[i];
+    const clipEnd = clip[(i + 1) % clip.length];
+    const input = output;
+    output = [];
+    if (!input.length) break;
+    let previous = input[input.length - 1];
+    for (const current of input) {
+      const currentInside = isInside(current, clipStart, clipEnd);
+      const previousInside = isInside(previous, clipStart, clipEnd);
+      if (currentInside) {
+        if (!previousInside) output.push(lineIntersection(previous, current, clipStart, clipEnd));
+        output.push(current);
+      } else if (previousInside) {
+        output.push(lineIntersection(previous, current, clipStart, clipEnd));
+      }
+      previous = current;
+    }
+  }
+  return output;
+}
+
+function boundsOverlap(a, b) {
+  return !(a.maxX <= b.minX || a.minX >= b.maxX || a.maxY <= b.minY || a.minY >= b.maxY);
+}
+
+function polygonIoU(a, b, areaA = polygonArea(a), areaB = polygonArea(b)) {
+  if (areaA <= 1e-9 || areaB <= 1e-9) return 0;
+  const intersection = clipPolygon(a, b);
+  const intersectionArea = polygonArea(intersection);
+  if (intersectionArea <= 1e-9) return 0;
+  return intersectionArea / ((areaA + areaB) - intersectionArea);
+}
+
+function duplicateOverlapWarnings() {
+  const candidates = state.annotations
+    .map((annotation, idx) => {
+      if (!annotation.visible || !Array.isArray(annotation.points) || annotation.points.length < 3) return null;
+      const points = annotation.points.map(([x, y]) => [Number(x), Number(y)]);
+      const area = polygonArea(points);
+      if (area <= 1e-9) return null;
+      return {
+        idx,
+        annotation,
+        points,
+        area,
+        bounds: annotationBoundsFromPoints(points),
+      };
+    })
+    .filter(Boolean);
+  const warnings = new Map();
+
+  for (let i = 0; i < candidates.length; i += 1) {
+    for (let j = i + 1; j < candidates.length; j += 1) {
+      const first = candidates[i];
+      const second = candidates[j];
+      if (!boundsOverlap(first.bounds, second.bounds)) continue;
+      const overlap = polygonIoU(first.points, second.points, first.area, second.area);
+      if (overlap < DUPLICATE_OVERLAP_THRESHOLD) continue;
+      const previousFirst = warnings.get(first.idx);
+      const previousSecond = warnings.get(second.idx);
+      if (!previousFirst || overlap > previousFirst.overlap) {
+        warnings.set(first.idx, { annotation: first.annotation, overlap });
+      }
+      if (!previousSecond || overlap > previousSecond.overlap) {
+        warnings.set(second.idx, { annotation: second.annotation, overlap });
+      }
+    }
+  }
+
+  return [...warnings.values()];
 }
 
 function buildHitCache() {
@@ -1785,6 +1912,7 @@ function onCanvasAreaMouseDown(event) {
 
 function onMouseMove(event) {
   if (state.view.isPanning) {
+    canvas.style.cursor = "grabbing";
     movePan(event.clientX, event.clientY);
     return;
   }
@@ -1792,6 +1920,7 @@ function onMouseMove(event) {
   state.mousePos = pt;
 
   if (state.mode === "draw") {
+    canvas.style.cursor = "crosshair";
     if (state.drawFormat === "seg" && state.draft.points.length > 0) {
       renderCanvas();
     } else if (state.drawFormat === "obb" && state.draft.points.length > 0) {
@@ -1806,6 +1935,7 @@ function onMouseMove(event) {
   if (state.dragging?.type === "point") {
     const target = state.annotations[state.dragging.annoIdx];
     if (!target) return;
+    canvas.style.cursor = cursorForHandle(target, state.dragging);
     if (target.format === "hbb" && state.dragging.handleType === "edge") {
       target.points = resizeHbbFromEdge(state.dragging.originalPoints, state.dragging.pointIdx, pt).map((point) => clampPoint(point));
     } else if (target.format === "hbb") {
@@ -1826,6 +1956,7 @@ function onMouseMove(event) {
   if (state.dragging?.type === "annotation") {
     const target = state.annotations[state.dragging.annoIdx];
     if (!target) return;
+    canvas.style.cursor = "move";
     const deltaX = pt[0] - state.dragging.start[0];
     const deltaY = pt[1] - state.dragging.start[1];
     const [safeDeltaX, safeDeltaY] = constrainedDelta(state.dragging.originalPoints, deltaX, deltaY);
@@ -1835,12 +1966,26 @@ function onMouseMove(event) {
   }
 
   if (state.dragging?.type === "marquee") {
+    canvas.style.cursor = "crosshair";
     state.dragging.current = pt;
     renderCanvas();
     return;
   }
 
-  canvas.style.cursor = findPoint(pt) ? "grab" : (findAnnotationHit(pt) !== -1 ? "pointer" : "default");
+  updateCanvasHover(pt);
+  updateCanvasCursor(pt);
+}
+
+function onCanvasMouseLeave() {
+  state.mousePos = null;
+  clearHoveredHandle();
+  if (state.hoveredAnnoIdx !== -1) {
+    state.hoveredAnnoIdx = -1;
+    renderCanvas();
+  }
+  if (!state.dragging && !state.view.isPanning) {
+    canvas.style.cursor = state.mode === "draw" ? "crosshair" : "default";
+  }
 }
 
 function onCanvasContextMenu(event) {
@@ -2050,30 +2195,191 @@ imgEl.onload = () => {
   hideEmptyState();
 };
 
-function drawPoint(pt, fillColor) {
+function drawPoint(pt, fillColor, isHot = false) {
   const [x, y] = toPixel(pt);
+  const radius = fillColor === "yellow" ? SELECTED_HANDLE_RADIUS : CORNER_HANDLE_RADIUS;
+  ctx.save();
   ctx.beginPath();
-  ctx.arc(x, y, fillColor === "yellow" ? SELECTED_HANDLE_RADIUS : CORNER_HANDLE_RADIUS, 0, Math.PI * 2);
+  ctx.arc(x, y, isHot ? radius + 2 : radius, 0, Math.PI * 2);
   ctx.fillStyle = fillColor;
   ctx.fill();
   ctx.strokeStyle = "#000";
-  ctx.lineWidth = 1.5;
+  ctx.lineWidth = isHot ? 2.5 : 1.75;
   ctx.stroke();
+  if (isHot) {
+    ctx.beginPath();
+    ctx.arc(x, y, Math.max(3, radius - 3), 0, Math.PI * 2);
+    ctx.fillStyle = "#000";
+    ctx.fill();
+  }
+  ctx.restore();
 }
 
-function drawEdgeHandle(pt, isSelected = false) {
+function drawEdgeHandle(pt, isSelected = false, isHot = false) {
   const [x, y] = toPixel(pt);
+  const radius = isHot ? EDGE_HANDLE_RADIUS + 2 : EDGE_HANDLE_RADIUS;
   ctx.save();
-  ctx.translate(x, y);
-  ctx.rotate(Math.PI / 4);
   ctx.beginPath();
-  ctx.rect(-EDGE_HANDLE_RADIUS, -EDGE_HANDLE_RADIUS, EDGE_HANDLE_RADIUS * 2, EDGE_HANDLE_RADIUS * 2);
+  ctx.arc(x, y, radius, 0, Math.PI * 2);
   ctx.fillStyle = isSelected ? "yellow" : "#ffffff";
   ctx.fill();
   ctx.strokeStyle = "#000";
-  ctx.lineWidth = 1.5;
+  ctx.lineWidth = isHot ? 2.5 : 1.75;
   ctx.stroke();
   ctx.restore();
+  if (isHot) {
+    ctx.beginPath();
+    ctx.arc(x, y, Math.max(3, EDGE_HANDLE_RADIUS - 2), 0, Math.PI * 2);
+    ctx.fillStyle = "#000";
+    ctx.fill();
+  }
+}
+
+function cursorFromAngle(angle) {
+  const normalized = ((angle % Math.PI) + Math.PI) % Math.PI;
+  const eighth = Math.PI / 8;
+  if (normalized < eighth || normalized >= Math.PI - eighth) return "ew-resize";
+  if (normalized < 3 * eighth) return "nesw-resize";
+  if (normalized < 5 * eighth) return "ns-resize";
+  if (normalized < 7 * eighth) return "nwse-resize";
+  return "ew-resize";
+}
+
+function cursorForHandle(annotation, hit) {
+  if (!annotation || !hit) return "default";
+  if (annotation.format === "hbb") {
+    if (hit.handleType === "edge") {
+      return hit.pointIdx % 2 === 0 ? "ns-resize" : "ew-resize";
+    }
+    return hit.pointIdx % 2 === 0 ? "nwse-resize" : "nesw-resize";
+  }
+  if (annotation.format === "obb" && Array.isArray(annotation.points) && annotation.points.length === 4) {
+    const points = annotation.points.map(imagePointToPixel);
+    const start = points[hit.pointIdx];
+    const end = points[(hit.pointIdx + 1) % points.length];
+    const next = points[(hit.pointIdx + 3) % points.length];
+    if (hit.handleType === "edge") {
+      const edgeAngle = Math.atan2(end[1] - start[1], end[0] - start[0]) + Math.PI / 2;
+      return cursorFromAngle(edgeAngle);
+    }
+    const diagonalAngle = Math.atan2(start[1] - next[1], start[0] - next[0]);
+    return cursorFromAngle(diagonalAngle);
+  }
+  return hit.handleType === "edge" ? "ew-resize" : "move";
+}
+
+function handleMatches(handle, annoIdx, pointIdx, handleType) {
+  return Boolean(handle)
+    && handle.annoIdx === annoIdx
+    && handle.pointIdx === pointIdx
+    && handle.handleType === handleType;
+}
+
+function sameHandle(first, second) {
+  if (!first && !second) return true;
+  if (!first || !second) return false;
+  return handleMatches(first, second.annoIdx, second.pointIdx, second.handleType);
+}
+
+function updateCanvasHover(pt) {
+  const pointHit = findPoint(pt);
+  const nextHovered = pointHit ? pointHit.annoIdx : findAnnotationHit(pt);
+  const nextHandle = pointHit
+    ? { annoIdx: pointHit.annoIdx, pointIdx: pointHit.pointIdx, handleType: pointHit.handleType }
+    : null;
+  const handleChanged = !sameHandle(state.hoveredHandle, nextHandle);
+  let selectionChanged = false;
+  if (nextHovered !== -1 && state.selectedAnnoIndices.length && !selectionIncludes(nextHovered) && !state.dragging) {
+    clearSelection();
+    hideClassPopup();
+    selectionChanged = true;
+  }
+  if (nextHovered !== state.hoveredAnnoIdx || handleChanged || selectionChanged) {
+    state.hoveredAnnoIdx = nextHovered;
+    state.hoveredHandle = nextHandle;
+    if (selectionChanged) {
+      renderAll();
+    } else {
+      renderCanvas();
+    }
+  }
+  return nextHovered;
+}
+
+function updateCanvasCursor(pt) {
+  if (state.mode === "draw") {
+    canvas.style.cursor = "crosshair";
+    return;
+  }
+  const pointHit = findPoint(pt);
+  if (pointHit) {
+    canvas.style.cursor = cursorForHandle(state.annotations[pointHit.annoIdx], pointHit);
+    return;
+  }
+  canvas.style.cursor = findAnnotationHit(pt) !== -1 ? "move" : "default";
+}
+
+function roundedRectPath(renderCtx, x, y, width, height, radius) {
+  const safeRadius = Math.min(radius, width / 2, height / 2);
+  renderCtx.beginPath();
+  renderCtx.moveTo(x + safeRadius, y);
+  renderCtx.lineTo(x + width - safeRadius, y);
+  renderCtx.quadraticCurveTo(x + width, y, x + width, y + safeRadius);
+  renderCtx.lineTo(x + width, y + height - safeRadius);
+  renderCtx.quadraticCurveTo(x + width, y + height, x + width - safeRadius, y + height);
+  renderCtx.lineTo(x + safeRadius, y + height);
+  renderCtx.quadraticCurveTo(x, y + height, x, y + height - safeRadius);
+  renderCtx.lineTo(x, y + safeRadius);
+  renderCtx.quadraticCurveTo(x, y, x + safeRadius, y);
+  renderCtx.closePath();
+}
+
+function drawDuplicateWarning(warning) {
+  const bounds = annotationBoundsFromPoints(warning.annotation.points);
+  const bubbleWidth = 92;
+  const bubbleHeight = 28;
+  const margin = 8;
+  const leftX = (bounds.minX * canvas.width) - bubbleWidth - margin;
+  const rightX = (bounds.maxX * canvas.width) + margin;
+  const preferredX = leftX >= margin ? leftX : rightX;
+  const x = clamp(preferredX, margin, Math.max(margin, canvas.width - bubbleWidth - margin));
+  const centerY = ((bounds.minY + bounds.maxY) / 2) * canvas.height;
+  const y = clamp(centerY - (bubbleHeight / 2), margin, Math.max(margin, canvas.height - bubbleHeight - margin));
+  const percent = Math.round(warning.overlap * 100);
+
+  ctx.save();
+  ctx.shadowColor = "rgba(120, 51, 12, 0.24)";
+  ctx.shadowBlur = 10;
+  ctx.shadowOffsetY = 2;
+  roundedRectPath(ctx, x, y, bubbleWidth, bubbleHeight, 8);
+  ctx.fillStyle = "rgba(255, 248, 235, 0.96)";
+  ctx.fill();
+  ctx.shadowColor = "transparent";
+  ctx.strokeStyle = "rgba(224, 112, 34, 0.92)";
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  const iconX = x + 15;
+  const iconY = y + bubbleHeight / 2;
+  ctx.beginPath();
+  ctx.arc(iconX, iconY, 8, 0, Math.PI * 2);
+  ctx.fillStyle = "#f97316";
+  ctx.fill();
+  ctx.fillStyle = "#fff";
+  ctx.font = "700 12px sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText("!", iconX, iconY + 0.5);
+
+  ctx.textAlign = "left";
+  ctx.fillStyle = "#7c2d12";
+  ctx.font = "700 12px sans-serif";
+  ctx.fillText(`重叠 ${percent}%`, x + 30, y + bubbleHeight / 2 + 0.5);
+  ctx.restore();
+}
+
+function drawDuplicateWarnings() {
+  duplicateOverlapWarnings().forEach((warning) => drawDuplicateWarning(warning));
 }
 
 function renderSelectionMarquee(renderCtx = ctx) {
@@ -2191,7 +2497,7 @@ function drawBaseAnnotation(annotation, options = {}) {
   staticCtx.strokeStyle = color;
   staticCtx.stroke();
   if (annotation.format !== "seg" && annotation.points.length >= 3) {
-    staticCtx.fillStyle = `${color}20`;
+    staticCtx.fillStyle = `${color}12`;
     staticCtx.fill();
   }
   if (!showLabel) return;
@@ -2206,6 +2512,7 @@ function drawAnnotation(annotation, idx, preview = false) {
   const isPrimarySelected = !preview && idx === state.selectedAnnoIdx;
   const isSelected = !preview && selectionIncludes(idx);
   const isHovered = !preview && idx === state.hoveredAnnoIdx;
+  const showHandles = isPrimarySelected || isHovered;
   const points = annotation.points;
   if (!points.length) return;
 
@@ -2230,7 +2537,7 @@ function drawAnnotation(annotation, idx, preview = false) {
   ctx.shadowBlur = 0;
 
   if (annotation.format !== "seg" && points.length >= 3) {
-    ctx.fillStyle = `${color}${isPrimarySelected ? "55" : (isSelected ? "40" : (isHovered ? "35" : "20"))}`;
+    ctx.fillStyle = `${color}${isPrimarySelected ? "52" : (isHovered ? "38" : (isSelected ? "30" : "18"))}`;
     ctx.fill();
   }
 
@@ -2242,15 +2549,23 @@ function drawAnnotation(annotation, idx, preview = false) {
   ctx.fillText(label, start[0] + 8, start[1] + 15);
   ctx.shadowBlur = 0;
 
-  if (isPrimarySelected) {
+  if (showHandles) {
     if (annotation.format !== "seg" && annotation.points.length === 4) {
       annotation.points.forEach((pt, pointIdx) => {
         const next = annotation.points[(pointIdx + 1) % annotation.points.length];
-        drawEdgeHandle(midpoint(pt, next), state.selectedHandleType === "edge" && pointIdx === state.selectedPointIdx);
+        drawEdgeHandle(
+          midpoint(pt, next),
+          state.selectedHandleType === "edge" && pointIdx === state.selectedPointIdx,
+          handleMatches(state.hoveredHandle, idx, pointIdx, "edge"),
+        );
       });
     }
     annotation.points.forEach((pt, pointIdx) => {
-      drawPoint(pt, state.selectedHandleType === "corner" && pointIdx === state.selectedPointIdx ? "yellow" : "white");
+      drawPoint(
+        pt,
+        state.selectedHandleType === "corner" && pointIdx === state.selectedPointIdx ? "yellow" : "white",
+        handleMatches(state.hoveredHandle, idx, pointIdx, "corner"),
+      );
     });
   }
 
@@ -2268,6 +2583,7 @@ function paintOverlayCanvas() {
     if (!annotation.visible) return;
     drawAnnotation(annotation, idx);
   });
+  drawDuplicateWarnings();
 
   if (state.mode === "draw" && state.draft.points.length > 0) {
     if (state.draft.format === "seg") {
@@ -2712,6 +3028,7 @@ function setupEvents() {
   el.canvasArea.addEventListener("mousedown", onCanvasAreaMouseDown);
   canvas.addEventListener("mousedown", onMouseDown);
   canvas.addEventListener("mousemove", onMouseMove);
+  canvas.addEventListener("mouseleave", onCanvasMouseLeave);
   canvas.addEventListener("click", onCanvasClick);
   window.addEventListener("mouseup", onMouseUp);
 

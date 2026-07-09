@@ -9,6 +9,7 @@ import re
 import shutil
 import socket
 import sys
+import errno
 from datetime import datetime
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -55,7 +56,26 @@ def write_json_file(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp_path.replace(path)
+    replace_or_overwrite(tmp_path, path)
+
+
+def replace_or_overwrite(tmp_path: Path, path: Path) -> None:
+    try:
+        tmp_path.replace(path)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) != 17 and exc.errno != errno.EXDEV:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        try:
+            path.write_bytes(tmp_path.read_bytes())
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def is_windows_absolute_path(raw_path: str) -> bool:
@@ -772,12 +792,12 @@ def serialize_label(annotations: list[dict]) -> str:
                 continue
             min_x, max_x = min(xs), max(xs)
             min_y, max_y = min(ys), max(ys)
-            points = [
-                [min_x, min_y],
-                [max_x, min_y],
-                [max_x, max_y],
-                [min_x, max_y],
-            ]
+            x_center = max(0.0, min(1.0, (min_x + max_x) / 2))
+            y_center = max(0.0, min(1.0, (min_y + max_y) / 2))
+            width = max(0.0, min(1.0, max_x - min_x))
+            height = max(0.0, min(1.0, max_y - min_y))
+            lines.append(" ".join([cls, f"{x_center:.6f}", f"{y_center:.6f}", f"{width:.6f}", f"{height:.6f}"]))
+            continue
         elif format_name == "obb":
             points = list(points[:4])
             if len(points) != 4:
@@ -798,7 +818,7 @@ def write_text_atomic(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     tmp_path.write_text(content, encoding="utf-8")
-    tmp_path.replace(path)
+    replace_or_overwrite(tmp_path, path)
 
 
 def safe_join(base: Path, request_path: str) -> Path | None:
