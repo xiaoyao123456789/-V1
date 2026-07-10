@@ -1054,6 +1054,123 @@ body.home-mode .top-strip-right {
   background: #f5e7e1;
 }
 
+.company-view {
+  display: grid;
+  gap: 16px;
+}
+
+.company-hero {
+  min-height: 170px;
+  padding: 28px 30px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background:
+    radial-gradient(circle at 78% 22%, rgba(255, 255, 255, 0.9), rgba(246, 243, 234, 0.58)),
+    linear-gradient(135deg, #fcfbf7 0%, #efe9dc 100%);
+  box-shadow: 0 16px 40px rgba(78, 70, 55, 0.08);
+}
+
+.company-hero h2 {
+  margin: 0 0 8px;
+  font-size: 34px;
+  letter-spacing: 0;
+}
+
+.company-hero p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.company-update-main {
+  min-width: 128px;
+  font-weight: 700;
+}
+
+.company-update-main:disabled,
+.company-update-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.company-version-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.company-version-card,
+.company-update-panel {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #fbfaf5;
+  box-shadow: var(--shadow);
+}
+
+.company-version-card {
+  display: grid;
+  gap: 8px;
+  padding: 18px;
+}
+
+.company-version-card span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.company-version-card strong {
+  font-size: 28px;
+}
+
+.company-version-card p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.company-version-card.has-update {
+  border-color: #b88747;
+  background: #fff9ed;
+}
+
+.company-update-panel {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+}
+
+.company-update-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.company-update-head h3 {
+  margin: 0 0 6px;
+  font-size: 18px;
+}
+
+.company-update-head p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.company-update-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.company-settings-grid {
+  display: grid;
+  grid-template-columns: 180px minmax(220px, 1fr) minmax(180px, 0.8fr);
+  gap: 12px;
+}
+
 .form-dialog {
   padding: 0;
   border: 0;
@@ -1072,6 +1189,39 @@ body.home-mode .top-strip-right {
   border: 1px solid var(--line);
   border-radius: 18px;
   background: #fbfaf5;
+}
+
+.update-file-list {
+  border: 1px solid var(--line-soft);
+  background: #f6f2e9;
+  border-radius: 12px;
+  padding: 12px;
+}
+
+.update-file-list {
+  display: grid;
+  gap: 6px;
+  max-height: 180px;
+  overflow: auto;
+  font-family: Consolas, "SFMono-Regular", monospace;
+  font-size: 12px;
+}
+
+.update-file-list:empty {
+  display: none;
+}
+
+.update-file-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  border-bottom: 1px solid rgba(217, 212, 200, 0.7);
+  padding-bottom: 6px;
+}
+
+.update-file-item:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
 }
 
 .dialog-head {

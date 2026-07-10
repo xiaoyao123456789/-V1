@@ -10,6 +10,7 @@ import shutil
 import socket
 import sys
 import errno
+import hashlib
 from datetime import datetime
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,7 +31,11 @@ DEFAULT_DATASET_DIR = ROOT / "data"
 DATASET_FILE = CONFIG_DIR / "dataset.json"
 PROJECTS_FILE = CONFIG_DIR / "projects.json"
 TEAM_FILE = CONFIG_DIR / "team.json"
+LOCAL_CONFIG_FILE = CONFIG_DIR / "local.json"
+VERSION_FILE = ROOT / "version.json"
+UPDATE_BACKUP_DIR = ROOT / "__backups__"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+UPDATE_ALLOWED_ROOT_FILES = {"app.py", "README.md", "version.json", "start.bat", "start.sh"}
 LEGACY_CLASSES_FILE = DEFAULT_DATASET_DIR / "classes.json"
 CLASS_COLOR_PALETTE = ["#ff4d4f", "#1890ff", "#52c41a", "#faad14", "#722ed1", "#eb2f96", "#13c2c2", "#fa8c16"]
 HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
@@ -1000,6 +1005,284 @@ def remote_request(member: dict, path: str, method: str = "GET", payload: dict |
     return parsed
 
 
+def default_local_config() -> dict:
+    return {
+        "role": "master",
+        "updateServer": "",
+        "updateToken": "",
+        "autoOpenBrowser": True,
+    }
+
+
+def normalize_local_config(raw: dict | None) -> dict:
+    raw = raw if isinstance(raw, dict) else {}
+    role = str(raw.get("role", "master")).strip().lower()
+    if role not in {"master", "client"}:
+        role = "master"
+    update_server = str(raw.get("updateServer", "")).strip()
+    if update_server and not update_server.startswith(("http://", "https://")):
+        update_server = f"http://{update_server}"
+    return {
+        "role": role,
+        "updateServer": update_server.rstrip("/"),
+        "updateToken": str(raw.get("updateToken", "")).strip(),
+        "autoOpenBrowser": bool(raw.get("autoOpenBrowser", True)),
+    }
+
+
+def read_local_config() -> dict:
+    payload = read_json_file(LOCAL_CONFIG_FILE, default_local_config())
+    normalized = normalize_local_config(payload)
+    if normalized != payload:
+        write_json_file(LOCAL_CONFIG_FILE, normalized)
+    return normalized
+
+
+def write_local_config(payload: dict) -> dict:
+    current = read_local_config()
+    next_payload = normalize_local_config({**current, **payload})
+    write_json_file(LOCAL_CONFIG_FILE, next_payload)
+    return next_payload
+
+
+def read_version_info() -> dict:
+    payload = read_json_file(VERSION_FILE, {})
+    if not isinstance(payload, dict):
+        payload = {}
+    return {
+        "version": str(payload.get("version", "0.0.0")).strip() or "0.0.0",
+        "notes": str(payload.get("notes", "")).strip(),
+    }
+
+
+def normalize_update_relpath(raw_path: str) -> str:
+    normalized = posixpath.normpath(str(raw_path).replace("\\", "/")).lstrip("/")
+    if not normalized or normalized == "." or normalized.startswith("../") or "/../" in f"/{normalized}/":
+        raise ValueError("更新文件路径不合法")
+    return normalized
+
+
+def is_update_allowed_path(rel_path: str) -> bool:
+    if rel_path in UPDATE_ALLOWED_ROOT_FILES:
+        return True
+    return rel_path.startswith("static/") and not rel_path.endswith("/")
+
+
+def update_file_path(rel_path: str) -> Path:
+    normalized = normalize_update_relpath(rel_path)
+    if not is_update_allowed_path(normalized):
+        raise ValueError("该文件不允许在线更新")
+    candidate = (ROOT / normalized).resolve()
+    try:
+        candidate.relative_to(ROOT)
+    except ValueError as exc:
+        raise ValueError("更新文件路径不合法") from exc
+    return candidate
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        while True:
+            chunk = file.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def iter_update_files() -> list[Path]:
+    files: list[Path] = []
+    for name in sorted(UPDATE_ALLOWED_ROOT_FILES):
+        path = ROOT / name
+        if path.exists() and path.is_file():
+            files.append(path)
+    if STATIC_DIR.exists():
+        files.extend(sorted(path for path in STATIC_DIR.rglob("*") if path.is_file()))
+    return files
+
+
+def build_update_manifest() -> dict:
+    version_info = read_version_info()
+    files = {}
+    for path in iter_update_files():
+        rel_path = path.relative_to(ROOT).as_posix()
+        if not is_update_allowed_path(rel_path):
+            continue
+        try:
+            stat = path.stat()
+            files[rel_path] = {
+                "sha256": sha256_file(path),
+                "size": stat.st_size,
+                "mtime": int(stat.st_mtime),
+            }
+        except OSError:
+            continue
+    return {
+        "version": version_info["version"],
+        "notes": version_info["notes"],
+        "files": files,
+    }
+
+
+def update_request_headers(token: str = "") -> dict:
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["X-Update-Token"] = token
+    return headers
+
+
+def remote_update_json(base_url: str, path: str, token: str = "", timeout: float = 10) -> dict:
+    url = urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
+    request = Request(url, headers=update_request_headers(token), method="GET")
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore").strip()
+        raise ValueError(detail or f"更新源请求失败: {exc.code}") from exc
+    except URLError as exc:
+        raise ValueError(f"无法访问更新源：{exc.reason}") from exc
+    try:
+        parsed = json.loads(body or "{}")
+    except json.JSONDecodeError as exc:
+        raise ValueError("更新源返回的数据不是有效 JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("更新源返回的数据格式不正确")
+    return parsed
+
+
+def remote_update_file(base_url: str, rel_path: str, token: str = "", timeout: float = 20) -> bytes:
+    path = normalize_update_relpath(rel_path)
+    url = urljoin(base_url.rstrip("/") + "/", f"api/update/file?path={quote(path)}")
+    headers = {"Accept": "application/octet-stream"}
+    if token:
+        headers["X-Update-Token"] = token
+    request = Request(url, headers=headers, method="GET")
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return response.read()
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore").strip()
+        raise ValueError(detail or f"下载更新文件失败: {exc.code}") from exc
+    except URLError as exc:
+        raise ValueError(f"无法下载更新文件：{exc.reason}") from exc
+
+
+def update_diff(local_manifest: dict, remote_manifest: dict) -> list[dict]:
+    local_files = local_manifest.get("files", {}) if isinstance(local_manifest.get("files"), dict) else {}
+    remote_files = remote_manifest.get("files", {}) if isinstance(remote_manifest.get("files"), dict) else {}
+    changed = []
+    for rel_path, remote_meta in sorted(remote_files.items()):
+        try:
+            normalized = normalize_update_relpath(rel_path)
+        except ValueError:
+            continue
+        if not is_update_allowed_path(normalized) or not isinstance(remote_meta, dict):
+            continue
+        remote_hash = str(remote_meta.get("sha256", ""))
+        local_hash = str(local_files.get(normalized, {}).get("sha256", "")) if isinstance(local_files.get(normalized), dict) else ""
+        if remote_hash and remote_hash != local_hash:
+            changed.append({
+                "path": normalized,
+                "sha256": remote_hash,
+                "size": int(remote_meta.get("size", 0) or 0),
+            })
+    return changed
+
+
+def check_remote_update(config: dict | None = None) -> dict:
+    local_config = config or read_local_config()
+    update_server = str(local_config.get("updateServer", "")).strip()
+    if not update_server:
+        raise ValueError("请先配置更新源地址")
+    remote_manifest = remote_update_json(update_server, "/api/update/manifest", str(local_config.get("updateToken", "")))
+    local_manifest = build_update_manifest()
+    changed = update_diff(local_manifest, remote_manifest)
+    return {
+        "local": local_manifest,
+        "remote": remote_manifest,
+        "changed": changed,
+        "needsUpdate": bool(changed),
+    }
+
+
+def write_update_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    tmp_path.write_bytes(data)
+    replace_or_overwrite(tmp_path, path)
+    if path.suffix == ".sh":
+        try:
+            path.chmod(path.stat().st_mode | 0o755)
+        except OSError:
+            pass
+
+
+def restore_update_backup(backup_entries: list[dict]) -> None:
+    for entry in reversed(backup_entries):
+        target = Path(entry["target"])
+        backup = Path(entry["backup"]) if entry.get("backup") else None
+        if backup and backup.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(backup, target)
+        elif target.exists():
+            target.unlink()
+
+
+def apply_remote_update() -> dict:
+    config = read_local_config()
+    check = check_remote_update(config)
+    changed = check["changed"]
+    if not changed:
+        return {**check, "applied": [], "backupDir": None, "restartRequired": False}
+
+    backup_dir = UPDATE_BACKUP_DIR / f"update_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:6]}"
+    backup_entries: list[dict] = []
+    applied = []
+    try:
+        for item in changed:
+            rel_path = item["path"]
+            target = update_file_path(rel_path)
+            backup_path = None
+            if target.exists():
+                backup_path = backup_dir / rel_path
+                backup_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(target, backup_path)
+            backup_entries.append({"target": str(target), "backup": str(backup_path) if backup_path else None})
+
+            data = remote_update_file(config["updateServer"], rel_path, config.get("updateToken", ""))
+            digest = hashlib.sha256(data).hexdigest()
+            if digest != item["sha256"]:
+                raise ValueError(f"文件校验失败：{rel_path}")
+            write_update_bytes(target, data)
+            applied.append(rel_path)
+    except Exception:
+        restore_update_backup(backup_entries)
+        raise
+
+    return {
+        **check,
+        "local": build_update_manifest(),
+        "applied": applied,
+        "backupDir": str(backup_dir.relative_to(ROOT)) if backup_dir.exists() else None,
+        "restartRequired": any(path == "app.py" for path in applied),
+    }
+
+
+def update_token_from_request(handler: BaseHTTPRequestHandler, parsed) -> str:
+    query_token = parse_qs(parsed.query).get("token", [""])[0]
+    return str(handler.headers.get("X-Update-Token") or query_token or "").strip()
+
+
+def require_update_auth(handler: BaseHTTPRequestHandler, parsed) -> bool:
+    expected = str(read_local_config().get("updateToken", "")).strip()
+    if expected and update_token_from_request(handler, parsed) != expected:
+        handler.send_error(403, "更新密钥不正确")
+        return False
+    return True
+
+
 def detect_local_ip() -> str:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
@@ -1137,6 +1420,32 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"stats": None, "datasetError": str(exc)}, status=200)
             return
+        if path == "/api/update/status":
+            try:
+                self.send_json({
+                    "ok": True,
+                    "config": read_local_config(),
+                    "manifest": build_update_manifest(),
+                })
+            except Exception as exc:
+                self.send_error(400, str(exc))
+            return
+        if path == "/api/update/manifest":
+            if not require_update_auth(self, parsed):
+                return
+            self.send_json(build_update_manifest())
+            return
+        if path == "/api/update/file":
+            if not require_update_auth(self, parsed):
+                return
+            raw_path = parse_qs(parsed.query).get("path", [""])[0]
+            try:
+                target = update_file_path(raw_path)
+            except Exception as exc:
+                self.send_error(400, str(exc))
+                return
+            self.send_file(target)
+            return
         if path.startswith("/api/review-snapshots/"):
             item_id = unquote(path.removeprefix("/api/review-snapshots/"))
             try:
@@ -1262,6 +1571,34 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(400, str(exc))
                 return
             self.send_json({"ok": True, "classes": read_legacy_classes()})
+            return
+
+        if path == "/api/update/config":
+            try:
+                payload = self.read_json_body()
+                config = write_local_config(payload)
+            except Exception as exc:
+                self.send_error(400, str(exc))
+                return
+            self.send_json({"ok": True, "config": config})
+            return
+
+        if path == "/api/update/check":
+            try:
+                result = check_remote_update()
+            except Exception as exc:
+                self.send_error(400, str(exc))
+                return
+            self.send_json({"ok": True, **result})
+            return
+
+        if path == "/api/update/apply":
+            try:
+                result = apply_remote_update()
+            except Exception as exc:
+                self.send_error(400, str(exc))
+                return
+            self.send_json({"ok": True, **result})
             return
 
         if path == "/api/projects":
@@ -1887,6 +2224,8 @@ def ensure_default_files() -> None:
     ensure_json_file(PROJECTS_FILE, default_projects_payload())
     ensure_json_file(TEAM_FILE, default_team_payload())
     ensure_json_file(DATASET_FILE, default_dataset_payload())
+    ensure_json_file(LOCAL_CONFIG_FILE, default_local_config())
+    ensure_json_file(VERSION_FILE, {"version": "2026.07.10.1", "notes": "Initial LAN update support"})
 
 
 def main() -> None:

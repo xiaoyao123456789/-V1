@@ -35,6 +35,14 @@ const state = {
     currentProjectId: null,
     search: "",
   },
+  update: {
+    config: null,
+    localManifest: null,
+    remoteManifest: null,
+    changed: [],
+    checking: false,
+    applying: false,
+  },
 };
 
 const el = {
@@ -46,6 +54,7 @@ const el = {
   dashboardProjectList: document.querySelector("#dashboardProjectList"),
   dashboardActivityList: document.querySelector("#dashboardActivityList"),
   dashboardTeamList: document.querySelector("#dashboardTeamList"),
+  companyView: document.querySelector("#companyView"),
   grid: document.querySelector("#grid"),
   teamSection: document.querySelector("#teamSection"),
   teamList: document.querySelector("#teamList"),
@@ -61,6 +70,7 @@ const el = {
   homeNavBtn: document.querySelector("#homeNavBtn"),
   projectNavBtn: document.querySelector("#projectNavBtn"),
   teamNavBtn: document.querySelector("#teamNavBtn"),
+  companyNavBtn: document.querySelector("#companyNavBtn"),
   projectDialog: document.querySelector("#projectDialog"),
   packageDialog: document.querySelector("#packageDialog"),
   memberDialog: document.querySelector("#memberDialog"),
@@ -178,6 +188,7 @@ function syncEditingClasses() {
 function currentMode() {
   if (state.currentView === "remote-projects" || state.currentView === "remote-packages") return "remote";
   if (state.currentView === "team") return "team";
+  if (state.currentView === "company") return "company";
   if (currentProject()) return "packages";
   if (state.currentView === "projects") return "projects";
   return "home";
@@ -205,6 +216,8 @@ function syncHash() {
   let nextHash = "#/home";
   if (state.currentView === "team") {
     nextHash = "#/team";
+  } else if (state.currentView === "company") {
+    nextHash = "#/company";
   } else if (state.currentView === "remote-projects") {
     nextHash = `#/team/${state.remote.member?.id || ""}`;
   } else if (state.currentView === "remote-packages") {
@@ -227,6 +240,11 @@ function restoreStateFromHash() {
   const remoteMemberMatch = hash.match(/^#\/team\/([^/]+)$/);
   if (hash === "#/team") {
     state.currentView = "team";
+    state.local.currentProjectId = null;
+    return;
+  }
+  if (hash === "#/company") {
+    state.currentView = "company";
     state.local.currentProjectId = null;
     return;
   }
@@ -296,6 +314,169 @@ function closeDialog(dialog) {
   dialog.close();
 }
 
+function updatePanelValues() {
+  return {
+    role: el.companyView.querySelector("[data-update-role]")?.value || "master",
+    updateServer: el.companyView.querySelector("[data-update-server]")?.value.trim() || "",
+    updateToken: el.companyView.querySelector("[data-update-token]")?.value.trim() || "",
+  };
+}
+
+function renderCompanyView() {
+  const config = state.update.config || {};
+  const localManifest = state.update.localManifest || {};
+  const remoteManifest = state.update.remoteManifest || {};
+  const changed = state.update.changed || [];
+  const latestVersion = remoteManifest.version || (config.role === "master" ? localManifest.version : "-");
+  const latestNotes = remoteManifest.notes || (config.role === "master" ? localManifest.notes : "配置更新源后自动检查最新版本");
+  const busy = state.update.checking || state.update.applying;
+  const canApplyUpdate = config.role === "client" && config.updateServer && !busy;
+  const summary = state.update.applying
+    ? "正在更新，请不要关闭服务..."
+    : state.update.checking
+      ? "正在检查更新源..."
+      : !remoteManifest.version
+        ? (config.role === "master" ? "当前设备可作为主控端提供版本。客户端填写这台设备的访问地址后即可更新。" : "填写主控端地址后，点击检查最新版本。")
+        : changed.length
+          ? `发现 ${changed.length} 个文件需要更新。更新前会自动备份本机旧文件。`
+          : "当前已经是最新版本。";
+
+  el.companyView.innerHTML = `
+    <section class="company-hero">
+      <div>
+        <p class="eyebrow">Yicun Technology</p>
+        <h2>易村科技</h2>
+        <p>局域网版本发布与客户端更新中心。</p>
+      </div>
+      <button class="primary-btn company-update-main" type="button" data-update-action="apply" ${canApplyUpdate ? "" : "disabled"}>一键更新</button>
+    </section>
+
+    <section class="company-version-grid">
+      <article class="company-version-card">
+        <span>当前版本</span>
+        <strong>${escapeHtml(localManifest.version || "-")}</strong>
+        <p>${escapeHtml(localManifest.notes || "本机正在运行的版本")}</p>
+      </article>
+      <article class="company-version-card ${changed.length ? "has-update" : ""}">
+        <span>最新版本</span>
+        <strong>${escapeHtml(latestVersion || "-")}</strong>
+        <p>${escapeHtml(latestNotes || "点击检查最新版本后显示")}</p>
+      </article>
+    </section>
+
+    <section class="company-update-panel">
+      <div class="company-update-head">
+        <div>
+          <h3>更新设置</h3>
+          <p>${escapeHtml(summary)}</p>
+        </div>
+        <div class="company-update-actions">
+          <button class="ghost-btn" type="button" data-update-action="save" ${busy ? "disabled" : ""}>保存配置</button>
+          <button class="ghost-btn" type="button" data-update-action="check" ${canApplyUpdate ? "" : "disabled"}>检查最新版本</button>
+        </div>
+      </div>
+      <div class="company-settings-grid">
+        <label class="field">
+          <span>当前设备角色</span>
+          <select data-update-role>
+            <option value="master" ${(config.role || "master") === "master" ? "selected" : ""}>主控端</option>
+            <option value="client" ${config.role === "client" ? "selected" : ""}>客户端</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>更新源地址</span>
+          <input data-update-server type="text" value="${escapeAttr(config.updateServer || "")}" placeholder="例如：http://192.168.1.10:8000">
+        </label>
+        <label class="field">
+          <span>更新密钥</span>
+          <input data-update-token type="text" value="${escapeAttr(config.updateToken || "")}" placeholder="为空则不校验">
+        </label>
+      </div>
+      <div class="update-file-list">
+        ${changed.map((item) => `
+          <div class="update-file-item">
+            <span>${escapeHtml(item.path)}</span>
+            <span>${formatFileSize(item.size || 0)}</span>
+          </div>
+        `).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function formatFileSize(size) {
+  const value = Number(size || 0);
+  if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${value} B`;
+}
+
+async function loadUpdateStatus(autoCheck = false) {
+  const payload = await request("/api/update/status");
+  state.update.config = payload.config || {};
+  state.update.localManifest = payload.manifest || {};
+  state.update.remoteManifest = null;
+  state.update.changed = [];
+  renderCompanyView();
+  if (autoCheck && state.update.config.role === "client" && state.update.config.updateServer) {
+    await checkUpdate({ skipSave: true });
+  }
+}
+
+async function saveUpdateConfig() {
+  const values = updatePanelValues();
+  const payload = await request("/api/update/config", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      role: values.role,
+      updateServer: values.updateServer,
+      updateToken: values.updateToken,
+    }),
+  });
+  state.update.config = payload.config || {};
+  state.update.remoteManifest = null;
+  state.update.changed = [];
+  renderCompanyView();
+  showStatus("更新配置已保存");
+}
+
+async function checkUpdate(options = {}) {
+  if (!options.skipSave) await saveUpdateConfig();
+  state.update.checking = true;
+  renderCompanyView();
+  try {
+    const payload = await request("/api/update/check", { method: "POST" });
+    state.update.localManifest = payload.local || state.update.localManifest;
+    state.update.remoteManifest = payload.remote || {};
+    state.update.changed = Array.isArray(payload.changed) ? payload.changed : [];
+    showStatus(state.update.changed.length ? `发现 ${state.update.changed.length} 个更新文件` : "当前已经是最新版本");
+  } finally {
+    state.update.checking = false;
+    renderCompanyView();
+  }
+}
+
+async function applyUpdate() {
+  if (!state.update.changed.length) {
+    await checkUpdate({ skipSave: false });
+    if (!state.update.changed.length) return;
+  }
+  state.update.applying = true;
+  renderCompanyView();
+  try {
+    const payload = await request("/api/update/apply", { method: "POST" });
+    state.update.localManifest = payload.local || state.update.localManifest;
+    state.update.remoteManifest = payload.remote || state.update.remoteManifest;
+    state.update.changed = [];
+    const restartText = payload.restartRequired ? "，后端代码已更新，请重启服务" : "，刷新页面即可生效";
+    showStatus(`更新完成${restartText}`);
+  } finally {
+    state.update.applying = false;
+    renderCompanyView();
+  }
+}
+
 function fitPackageNameInput(input) {
   if (!input) return;
 }
@@ -350,6 +531,7 @@ function updateNavigation() {
   el.homeNavBtn.classList.toggle("active", state.currentView === "home");
   el.projectNavBtn.classList.toggle("active", state.currentView === "projects");
   el.teamNavBtn.classList.toggle("active", state.currentView === "team" || state.currentView === "remote-projects" || state.currentView === "remote-packages");
+  el.companyNavBtn.classList.toggle("active", state.currentView === "company");
 }
 
 function resetSearch() {
@@ -380,6 +562,12 @@ function setProjectsView(projectId = null) {
 function setTeamView() {
   clearRemoteContext();
   state.currentView = "team";
+  state.local.currentProjectId = null;
+}
+
+function setCompanyView() {
+  clearRemoteContext();
+  state.currentView = "company";
   state.local.currentProjectId = null;
 }
 
@@ -418,6 +606,14 @@ function updateHeader() {
     el.scopeLabel.textContent = `团队 · ${filteredMembers().length}`;
     el.createBtn.title = "添加成员";
     el.searchInput.placeholder = "Search members";
+    el.backBtn.hidden = true;
+    return;
+  }
+
+  if (mode === "company") {
+    el.scopeLabel.textContent = "易村科技";
+    el.searchInput.hidden = true;
+    el.createBtn.hidden = true;
     el.backBtn.hidden = true;
     return;
   }
@@ -793,9 +989,10 @@ function render() {
 
   const mode = currentMode();
   el.dashboardView.hidden = mode !== "home";
-  el.grid.hidden = mode === "team" || mode === "home";
+  el.grid.hidden = mode === "team" || mode === "home" || mode === "company";
   el.teamSection.hidden = mode !== "team";
   el.teamList.hidden = mode !== "team";
+  el.companyView.hidden = mode !== "company";
   el.classSection.hidden = mode !== "packages";
 
   if (mode === "home") {
@@ -804,6 +1001,13 @@ function render() {
   }
   if (mode === "team") {
     renderTeam();
+    return;
+  }
+  if (mode === "company") {
+    renderCompanyView();
+    if (!state.update.localManifest && !state.update.checking && !state.update.applying) {
+      loadUpdateStatus(true).catch((error) => showStatus(error.message || "读取版本信息失败", "error"));
+    }
     return;
   }
 
@@ -1250,6 +1454,8 @@ function handleViewJump(view) {
     setProjectsView();
   } else if (view === "team") {
     setTeamView();
+  } else if (view === "company") {
+    setCompanyView();
   } else {
     setHomeView();
   }
@@ -1302,6 +1508,10 @@ el.teamNavBtn.addEventListener("click", () => {
   handleViewJump("team");
 });
 
+el.companyNavBtn.addEventListener("click", () => {
+  handleViewJump("company");
+});
+
 el.projectForm.addEventListener("submit", (event) => {
   createProject(event).catch((error) => showStatus(error.message, "error"));
 });
@@ -1334,6 +1544,30 @@ el.classColorInput.addEventListener("change", scheduleClassAutoSave);
 
 el.memberForm.addEventListener("submit", (event) => {
   createMember(event).catch((error) => showStatus(error.message, "error"));
+});
+
+el.companyView.addEventListener("click", (event) => {
+  const action = event.target.closest("[data-update-action]");
+  if (!action) return;
+  if (action.dataset.updateAction === "save") {
+    saveUpdateConfig().catch((error) => showStatus(error.message, "error"));
+    return;
+  }
+  if (action.dataset.updateAction === "check") {
+    checkUpdate().catch((error) => {
+      state.update.checking = false;
+      renderCompanyView();
+      showStatus(error.message, "error");
+    });
+    return;
+  }
+  if (action.dataset.updateAction === "apply") {
+    applyUpdate().catch((error) => {
+      state.update.applying = false;
+      renderCompanyView();
+      showStatus(error.message, "error");
+    });
+  }
 });
 
 document.querySelectorAll("[data-close]").forEach((button) => {
